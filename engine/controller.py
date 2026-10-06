@@ -1,31 +1,31 @@
 """Automation controller (engine side): system-wide session state machine.
 
-ONE global controller per engine process is the source of truth for automation
-state (§10). It owns:
-  * controller-UI subprocess lifecycle (topmost companion window + tray-less)
-  * states: IDLE/RUNNING/PAUSED/USER_CONTROL/WAITING_APPROVAL/STOPPING/
-    STOPPED/FAILED/BLOCKED
-  * pause / resume / take-control / stop, ALL converging on the single
-    EmergencyStop cancellation path (§15)
-  * approval request + decision store, validated by the engine's SafetyPolicy
-    before an approve can ever take effect (§22)
-  * heartbeat watchdog: UI death or heartbeat loss -> safe pause (§14)
-  * user-intervention policy: BLOCK/PAUSE/TAKE_CONTROL/ALLOW, default PAUSE
-  * strict resource ownership: controller PID + child PIDs + HWND (§27)
-
-The controller NEVER executes automation primitives. It only signals through
-SafetyPolicy-checked pathways; it holds no capability the executor lacks.
+Connects to the system-wide singleton Controller UI over Windows Named Pipe IPC.
+Decoupled from individual MCP process lifetimes:
+  * Exactly ONE controller UI per Windows desktop session
+  * Multiple MCP clients and engine processes share the same control surface
+  * States: IDLE, RUNNING, PAUSED, USER_CONTROL, WAITING_APPROVAL, STOPPING, STOPPED
+  * Real user controls: Take Control, Resume, Stop
+  * Zero focus stealing, zero shell / HID interference
 """
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
 import itertools
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
+import uuid
+from multiprocessing.connection import Client
+
+user32 = ctypes.windll.user32
+user32.IsWindow.argtypes = [wintypes.HWND]
+user32.IsWindow.restype = wintypes.BOOL
 
 STATES = ("IDLE", "RUNNING", "PAUSED", "USER_CONTROL", "WAITING_APPROVAL",
           "STOPPING", "STOPPED", "FAILED", "BLOCKED")
@@ -35,13 +35,41 @@ INTERVENTION_MODES = ("BLOCK", "PAUSE", "TAKE_CONTROL", "ALLOW")
 APPROVAL_TTL_S = 300.0
 _TOKENS = itertools.count(1)
 
+PIPE_NAME = r"\\.\pipe\orvex_controller_ipc"
+MUTEX_NAME = r"Local\ORVEX_ControllerUI_Singleton_Mutex"
+LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
+ORVEX_DIR = Path(LOCALAPPDATA) / "ORVEX" if LOCALAPPDATA else Path.home() / ".orvex"
+ORVEX_DIR.mkdir(parents=True, exist_ok=True)
+KEY_FILE = ORVEX_DIR / ".controller_ipc_key"
+STATE_FILE = ORVEX_DIR / ".controller_state.json"
+
+
+def attach_to_input_desktop() -> None:
+    try:
+        hdesk = user32.OpenInputDesktop(0, False, 0x01FF)
+        if hdesk:
+            user32.SetThreadDesktop(hdesk)
+    except Exception:
+        pass
+
+
+def _get_auth_key() -> bytes:
+    if KEY_FILE.exists():
+        try:
+            return KEY_FILE.read_bytes()
+        except Exception:
+            pass
+    # Generate fallback
+    key = os.urandom(32)
+    try:
+        KEY_FILE.write_bytes(key)
+    except Exception:
+        pass
+    return key
+
 
 class ApprovalToken:
-    """Structured, single-use approval record.
-
-    `request` is engine-supplied structured data; the UI renders it verbatim so
-    the prompt can never be generic or misleading (§8).
-    """
+    """Structured, single-use approval record."""
 
     __slots__ = ("token", "request", "created", "decision", "decided_by")
 
@@ -57,10 +85,12 @@ class ApprovalToken:
         return (time.time() - self.created) > APPROVAL_TTL_S
 
     def summary(self) -> dict:
-        return {"operation": self.request.get("operation", "?"),
-                "target": self.request.get("target", "?"),
-                "reason": self.request.get("reason", ""),
-                "code": self.request.get("code", "")}
+        return {
+            "operation": self.request.get("operation", "?"),
+            "target": self.request.get("target", "?"),
+            "reason": self.request.get("reason", ""),
+            "code": self.request.get("code", ""),
+        }
 
 
 class AutomationController:
@@ -69,14 +99,17 @@ class AutomationController:
             raise ValueError(f"intervention must be one of {INTERVENTION_MODES}")
         self.intervention = intervention
         self.state = "IDLE"
-        self.paused = threading.Event()   # set = paused, polled at node boundaries
+        self.paused = threading.Event()
         self.user_control = threading.Event()
+
+        self.client_id = f"mcp_{os.getpid()}_{uuid.uuid4().hex[:6]}"
+        self.conn: any = None
         self.proc: subprocess.Popen | None = None
         self._wlock = threading.Lock()
         self._last_alive = 0.0
         self._watchdog: threading.Thread | None = None
         self._reader: threading.Thread | None = None
-        self._stop_esc: callable | None = None   # wired to EmergencyStop.cancel
+        self._stop_esc: callable | None = None
         self._on_pause_cb: callable | None = None
         self.approvals: dict[str, ApprovalToken] = {}
         self.transitions: list[tuple[str, str, float]] = []
@@ -87,149 +120,145 @@ class AutomationController:
         self._t0 = 0.0
         self.perf: dict[str, float] = {}
         self.degraded = False
-        # validator: (token, request) -> (ok, reason). MUST be injected by the
-        # engine; without it an approve is refused, never assumed (§22).
+
         self._approval_validator: callable | None = None
         self._ulock = threading.Lock()
         self._pre_approval = "IDLE"
         self._ui_hwnd = 0
+        self._ui_pid = 0
 
     # ------------------------------------------------------------ lifecycle
 
     def start(self) -> bool:
-        """Launch the companion UI. False => degraded mode: automation may only
-        proceed because ESC + MCP cancel remain independent always-available
-        emergency stops (§14)."""
-        if os.environ.get("ORVEX_NO_UI", "0") in ("1", "true", "yes") or \
-           os.environ.get("SFMCP_NO_UI", "0") in ("1", "true", "yes") or \
-           os.environ.get("ORVEX_HEADLESS", "0") in ("1", "true", "yes"):
-            self.proc = None
+        """Connect to or spawn the singleton UI companion service."""
+        attach_to_input_desktop()
+        if (os.environ.get("ORVEX_NO_UI", "0") in ("1", "true", "yes") or
+                os.environ.get("SFMCP_NO_UI", "0") in ("1", "true", "yes") or
+                os.environ.get("ORVEX_HEADLESS", "0") in ("1", "true", "yes")):
             self.degraded = True
             return False
-        if self.proc is not None and self.proc.poll() is None:
+
+        if self.conn is not None:
             return True
-        try:
-            ui = str(Path(__file__).resolve().parent / "controller_ui.py")
-            python_bin = sys.executable
-            w_candidate = Path(sys.executable).with_name("pythonw.exe")
-            if w_candidate.exists():
-                python_bin = str(w_candidate)
-            self.proc = subprocess.Popen(
-                [python_bin, "-u", ui],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, text=True, bufsize=1,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        except Exception:  # noqa: BLE001
-            self.proc = None
+
+        auth_key = _get_auth_key()
+
+        # 1. Try connecting to an already running UI service
+        connected = self._try_connect(auth_key)
+
+        # 2. If not running, spawn the UI companion process
+        if not connected:
+            self._spawn_ui()
+            # Wait up to 3 seconds for pipe availability
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                if self._try_connect(auth_key):
+                    connected = True
+                    break
+                time.sleep(0.06)
+
+        if not connected:
             self.degraded = True
             return False
+
         self._last_alive = time.time()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
         self._watchdog = threading.Thread(target=self._watch_loop, daemon=True)
         self._watchdog.start()
+
+        # Initial handshake register
+        self._send({"cmd": "register_client", "client_id": self.client_id, "pid": os.getpid()})
         return True
+
+    def _try_connect(self, auth_key: bytes) -> bool:
+        try:
+            self.conn = Client(PIPE_NAME, "AF_PIPE", authkey=auth_key)
+            return True
+        except Exception:
+            self.conn = None
+            return False
+
+    def _spawn_ui(self) -> None:
+        try:
+            ui_path = str(Path(__file__).resolve().parent / "controller_ui.py")
+            python_bin = sys.executable
+            w_cand = Path(sys.executable).with_name("pythonw.exe")
+            if w_cand.exists():
+                python_bin = str(w_cand)
+
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            self.proc = subprocess.Popen(
+                [python_bin, "-u", ui_path],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=flags
+            )
+        except Exception:
+            self.proc = None
 
     @property
     def ui_alive(self) -> bool:
-        return self.proc is not None and self.proc.poll() is None
+        if self.conn is None:
+            return False
+        # Consider alive if recent heartbeat
+        return (time.time() - self._last_alive) < 10.0
 
     def owned(self) -> dict:
-        """Strict ownership record for shutdown auditing (§27)."""
-        pids: list[int] = []
-        if self.proc is not None:
-            pids.append(self.proc.pid)
+        """Strict ownership record for shutdown auditing."""
+        attach_to_input_desktop()
+        pid = self._ui_pid
+        hwnd = self._ui_hwnd
+
+        if STATE_FILE.exists():
             try:
-                import psutil
-                for ch in psutil.Process(self.proc.pid).children(recursive=True):
-                    pids.append(ch.pid)
-            except Exception:  # noqa: BLE001
+                data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+                file_hwnd = data.get("hwnd", 0)
+                file_wid = data.get("wid", 0)
+                file_pid = data.get("pid", 0)
+                if file_pid:
+                    pid = file_pid
+                    self._ui_pid = file_pid
+                if file_hwnd and user32.IsWindow(file_hwnd):
+                    hwnd = file_hwnd
+                    self._ui_hwnd = file_hwnd
+                elif file_wid and user32.IsWindow(file_wid):
+                    hwnd = file_wid
+                    self._ui_hwnd = file_wid
+            except Exception:
                 pass
-        hwnds: list[int] = []
-        if self.ui_alive:
-            hwnds = self._ui_windows()
-        return {"controller_pid": self.proc.pid if self.proc is not None else 0,
-                "child_pids": pids, "window_handles": hwnds,
-                "alive": self.ui_alive}
 
-    def _ui_windows(self) -> list[int]:
-        try:
-            import ctypes
-            u = ctypes.windll.user32
-            if self._ui_hwnd and u.IsWindow(self._ui_hwnd) and u.IsWindowVisible(self._ui_hwnd):
-                return [self._ui_hwnd]
-        except Exception:
-            pass
-        try:
-            import ctypes
-            import psutil
-
-            u = ctypes.windll.user32
-            found: list[int] = []
-            target_pids: set[int] = set()
-            if self.proc is not None:
-                target_pids.add(self.proc.pid)
-                try:
-                    for ch in psutil.Process(self.proc.pid).children(recursive=True):
-                        target_pids.add(ch.pid)
-                except Exception:  # noqa: BLE001
-                    pass
-
-            if not target_pids:
-                return []
-
-            def cb(hwnd, _l):
+        pids = [pid] if pid > 0 else []
+        hwnds = [hwnd] if (hwnd > 0 and user32.IsWindow(hwnd)) else []
+        if not hwnds and pid > 0:
+            def cb(h, _l):
                 wpid = ctypes.c_ulong()
-                u.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
-                if wpid.value in target_pids and u.IsWindowVisible(hwnd):
-                    text = ctypes.create_unicode_buffer(256)
-                    u.GetWindowTextW(hwnd, text, 256)
-                    if text.value == "ORVEX":
-                        found.append(int(hwnd))
+                user32.GetWindowThreadProcessId(h, ctypes.byref(wpid))
+                if wpid.value == pid and user32.IsWindow(h):
+                    hwnds.append(h)
                 return 1
-
             CB = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_size_t, ctypes.c_size_t)
-            u.EnumWindows(CB(cb), 0)
-            return found
-        except Exception:  # noqa: BLE001
-            return []
+            user32.EnumWindows(CB(cb), 0)
+        return {
+            "controller_pid": pid,
+            "child_pids": pids,
+            "window_handles": hwnds,
+            "alive": self.ui_alive,
+        }
 
     def shutdown(self) -> dict:
         rec = self.owned()
-        proc = self.proc
-        # send the clean exit request while the handle is still current,
-        # otherwise _send() short-circuits and the UI is only terminated
-        if proc is not None:
+        if self.conn is not None:
             try:
-                self._send({"cmd": "exit"})
-            except Exception:  # noqa: BLE001
+                self._send({"cmd": "disconnect", "client_id": self.client_id})
+                self.conn.close()
+            except Exception:
                 pass
-        self.proc = None
-        if proc is not None:
-            try:
-                proc.wait(timeout=5)
-            except Exception:  # noqa: BLE001
-                try:
-                    proc.terminate()  # owned child only
-                except Exception:  # noqa: BLE001
-                    pass
-                try:
-                    proc.wait(timeout=3)
-                except Exception:  # noqa: BLE001
-                    pass
-            rec["controller_exited"] = proc.poll() is not None
-            rec["processes_terminated"] = 1 if rec["controller_exited"] else 0
-            for stream in (proc.stdin, proc.stdout, proc.stderr):
-                try:
-                    if stream is not None:
-                        stream.close()
-                except Exception:  # noqa: BLE001
-                    pass
-        else:
-            rec["controller_exited"] = True
-            rec["processes_terminated"] = 0
+            self.conn = None
+
         self.active_tasks.clear()
         self.approvals.clear()
+        rec["controller_exited"] = True
+        rec["processes_terminated"] = 0
         return rec
 
     # ------------------------------------------------------------ states
@@ -243,9 +272,15 @@ class AutomationController:
         self.state = state
         self.last_text = text
         self.last_detail = detail
-        self._send({"cmd": "state", "state": state, "text": text,
-                    "detail": detail, "expand": expand, "token": token,
-                    "task_count": len(self.active_tasks)})
+        self._send({
+            "cmd": "set_state",
+            "client_id": self.client_id,
+            "state": state,
+            "text": text,
+            "detail": detail,
+            "token": token,
+            "task_count": len(self.active_tasks),
+        })
         self.perf["last_transition_ms"] = (time.perf_counter() - t) * 1000.0
 
     def begin_task(self, goal: str, task_id: str = "") -> None:
@@ -255,44 +290,52 @@ class AutomationController:
             self.active_tasks.add(task_id)
         self.paused.clear()
         self.user_control.clear()
-        self._set("RUNNING", "Automation Active",
-                  f"AI is controlling this PC. Task: {goal}", expand=True)
+        self.state = "RUNNING"
+        self._send({
+            "cmd": "task_begin",
+            "client_id": self.client_id,
+            "task_id": task_id,
+            "goal": goal,
+        })
 
     def end_task(self, task_id: str = "", status: str = "success") -> None:
         if task_id:
             self.active_tasks.discard(task_id)
+        self._send({
+            "cmd": "task_end",
+            "client_id": self.client_id,
+            "task_id": task_id,
+            "status": status,
+        })
         if not self.active_tasks and self.state == "RUNNING":
             if status == "success":
-                self._set("IDLE", "Ready", "Task completed")
+                self.state = "IDLE"
             elif status in ("stopped", "cancelled"):
-                self._set("STOPPED", "Automation Stopped", "Cancelled by user")
+                self.state = "STOPPED"
             elif status == "failed":
-                self._set("FAILED", "Automation Failed", "Task failed")
+                self.state = "FAILED"
 
     def node_update(self, op: str, app_hint: str = "") -> None:
         if self.state != "RUNNING":
             return
-        el = time.time() - self._t0
-        app_part = f"Controlling: {app_hint}\n" if app_hint else ""
-        self._send({"cmd": "state", "state": "RUNNING",
-                    "text": "Automation Active",
-                    "detail": f"{app_part}Step: {op} | Elapsed: {el:.1f} s",
-                    "expand": True,
-                    "task_count": len(self.active_tasks)})
+        self._send({
+            "cmd": "node_update",
+            "client_id": self.client_id,
+            "op": op,
+            "app_hint": app_hint,
+        })
 
     def check_paused(self, is_cancelled) -> str:
-        """Polled at node boundaries. is_cancelled: zero-arg callable.
-        Returns 'go' | 'stop'. Pause waits for the user; cancel always wins."""
         try:
             if is_cancelled():
                 return "stop"
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         while self.paused.is_set():
             try:
                 if is_cancelled():
                     return "stop"
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
             time.sleep(0.05)
         return "go"
@@ -318,27 +361,21 @@ class AutomationController:
         t = time.perf_counter()
         self.paused.clear()
         self.user_control.clear()
-        self._set("RUNNING", "Automation Active",
+        self._set("RUNNING", "Automating",
                   f"AI is controlling this PC. Task: {self.task_info.get('goal', '')}",
                   expand=True)
         self.perf["resume_ms"] = (time.perf_counter() - t) * 1000.0
         return True
 
     def stop(self, why: str = "user") -> dict:
-        """Strongest user control: stop the AUTOMATION, not the resources.
-
-        Converges on the one EmergencyStop.cancel path shared by ESC, the
-        controller button and the MCP cancel tool (§7, §15). No taskkill, no
-        process kill, no driver or HID reset.
-        """
         t = time.perf_counter()
-        self._set("STOPPING", "Stopping", why)
+        self.state = "STOPPING"
         stopped = False
         if self._stop_esc is not None:
             try:
                 self._stop_esc()
                 stopped = True
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
         self.paused.clear()
         self.user_control.set()
@@ -366,18 +403,13 @@ class AutomationController:
             self.approvals[token] = rec
         s = rec.summary()
         self._pre_approval = self.state
-        self._set("WAITING_APPROVAL", "Approval Required",
-                  f"Automation wants to: {s['operation']} {s['target']}".strip()[:300],
+        self._set("WAITING_APPROVAL", "Action Required",
+                  f"{s['operation']} {s['target']}".strip()[:200],
                   expand=True, token=token)
         return rec.summary()
 
     def approval_decide(self, token: str, decision: str,
                         source: str = "ui") -> dict:
-        """Sole approval funnel. UI buttons, MCP tools and tests all land here.
-
-        Approve is REFUSED unless the engine-injected validator re-checks the
-        original safety gate and returns ok (§22).
-        """
         if decision not in ("approve", "deny"):
             return {"status": "failed", "reason": "bad_decision"}
         with self._ulock:
@@ -395,7 +427,7 @@ class AutomationController:
                             "reason": "approval_validator_missing"}
                 try:
                     ok, why = self._approval_validator(token, dict(rec.request))
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     return {"status": "failed",
                             "reason": f"validator_error:{type(e).__name__}"}
                 if not ok:
@@ -403,6 +435,7 @@ class AutomationController:
                     return {"status": "blocked", "reason": why}
             rec.decision = decision
             rec.decided_by = source
+
         self.perf.setdefault("approval_ms", 0.0)
         if decision == "deny":
             self._set("STOPPED", "Automation Stopped",
@@ -410,21 +443,20 @@ class AutomationController:
         else:
             back = self._pre_approval if self._pre_approval in (
                 "RUNNING", "PAUSED", "USER_CONTROL") else "RUNNING"
-            self._set(back, "Automation Active" if back == "RUNNING"
-                      else ("Automation Paused" if back == "PAUSED" else "You have control"),
+            self._set(back, "Automating" if back == "RUNNING"
+                      else ("Manual Control" if back == "USER_CONTROL" else "Automation Paused"),
                       "Approval granted. Resuming the same session.")
         return {"status": decision, "token": token, "source": source}
 
     def approval_wait(self, token: str, timeout_s: float = 300.0,
                       is_cancelled=None) -> dict:
-        """Engine-side wait for a human decision. Stop/cancel always wins."""
         deadline = time.time() + timeout_s
         while True:
             if is_cancelled is not None:
                 try:
                     if is_cancelled():
                         return {"status": "cancelled", "reason": "cancelled"}
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
             with self._ulock:
                 rec = self.approvals.get(token)
@@ -448,57 +480,53 @@ class AutomationController:
     # ------------------------------------------------------------ wire
 
     def _send(self, msg: dict) -> None:
-        if self.proc is None or self.proc.stdin is None:
+        if self.conn is None:
             return
         try:
             with self._wlock:
-                self.proc.stdin.write(json.dumps(msg) + "\n")
-                self.proc.stdin.flush()
-        except Exception:  # noqa: BLE001
-            pass  # broken pipe -> watchdog safe-pause (§14)
+                self.conn.send(msg)
+        except Exception:
+            self.conn = None
+            self.degraded = True
 
     def input_window(self, ms: float = 600.0) -> None:
-        """Tell the UI which interval contains our own injected input, so
-        physical user input is never confused with automation input (§12)."""
         self._send({"cmd": "input_window", "ms": ms})
 
     def _read_loop(self) -> None:
         try:
-            assert self.proc is not None and self.proc.stdout is not None
-            for line in self.proc.stdout:
+            while self.conn is not None:
                 try:
-                    msg = json.loads(line)
-                except Exception:  # noqa: BLE001
-                    continue
-                self._on_ui_event(msg.get("event", ""), msg.get("token", ""), msg=msg)
-        except Exception:  # noqa: BLE001
-            pass
+                    msg = self.conn.recv()
+                except (EOFError, BrokenPipeError, ConnectionResetError):
+                    break
+                except Exception:
+                    break
 
-    def _on_ui_event(self, ev: str, token: str = "", msg: dict | None = None) -> None:
-        if ev == "alive":
-            self._last_alive = time.time()
-            if msg and "hwnd" in msg:
-                self._ui_hwnd = int(msg["hwnd"])
-        elif ev == "pause":
-            self.pause("controller button")
-            self._fire_pause_cb("pause")
-        elif ev == "take_control":
-            self.take_control()
-            self._fire_pause_cb("take_control")
-        elif ev == "resume":
-            self.resume()
-        elif ev == "stop":
-            self.stop("controller button")
-        elif ev in ("approve", "deny"):
-            tok = token or (self._pending_token() or "")
-            if tok:
-                self.approval_decide(tok, ev, source="controller_ui")
-        elif ev == "user_intervention":
-            self._on_intervention()
-        elif ev == "ui_closed_by_user":
-            # User dismissed the panel: treat as an unavailable indicator.
-            if self.state in ("RUNNING", "PAUSED", "USER_CONTROL", "WAITING_APPROVAL"):
-                self.pause("indicator closed by user (fail-safe)")
+                ev = msg.get("event", "")
+                if ev == "alive":
+                    self._last_alive = time.time()
+                    if "pid" in msg:
+                        self._ui_pid = int(msg["pid"])
+                    if "hwnd" in msg:
+                        self._ui_hwnd = int(msg["hwnd"])
+                elif ev == "take_control":
+                    self.take_control()
+                    self._fire_pause_cb("take_control")
+                elif ev == "resume":
+                    self.resume()
+                elif ev == "stop":
+                    self.stop("controller button")
+                elif ev in ("approve", "deny"):
+                    tok = msg.get("token") or (self._pending_token() or "")
+                    if tok:
+                        self.approval_decide(tok, ev, source="controller_ui")
+                elif ev == "user_intervention":
+                    self._on_intervention()
+        except Exception:
+            pass
+        finally:
+            self.conn = None
+            self.degraded = True
 
     def _pending_token(self) -> str | None:
         with self._ulock:
@@ -511,7 +539,7 @@ class AutomationController:
         if self._on_pause_cb is not None:
             try:
                 self._on_pause_cb(why)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
     def _on_intervention(self) -> None:
@@ -523,33 +551,28 @@ class AutomationController:
             self.stop("user intervention (BLOCK policy)")
         elif self.intervention == "TAKE_CONTROL":
             self.take_control()
-        else:  # PAUSE is the production default
+        else:
             self.pause("user_intervention_detected")
 
     def _watch_loop(self) -> None:
-        while True:
+        while self.conn is not None:
             time.sleep(1.0)
-            if self.proc is None:
-                return
-            if self.proc.poll() is not None:
-                self.degraded = True
-                # UI died on its own: safe-pause if work is in flight (§14).
-                if self.state in ("RUNNING", "PAUSED", "USER_CONTROL", "WAITING_APPROVAL"):
-                    self.pause("indicator unavailable (fail-safe)")
-                return
             if time.time() - self._last_alive > 8.0 and self.state == "RUNNING":
                 self.pause("indicator heartbeat lost (fail-safe)")
 
     def status(self) -> dict:
         with self._ulock:
             pending = [t for t, r in self.approvals.items() if r.decision is None]
-        return {"state": self.state,
-                "indicator": "active" if self.ui_alive else "degraded-no-ui",
-                "ui_alive": self.ui_alive, "degraded": self.degraded,
-                "task_count": len(self.active_tasks),
-                "tasks": sorted(self.active_tasks),
-                "intervention_policy": self.intervention,
-                "pending_approvals": pending,
-                "emergency_stop_path": "shared",
-                "owned": self.owned(),
-                "perf_ms": dict(self.perf)}
+        return {
+            "state": self.state,
+            "indicator": "active" if self.ui_alive else "degraded-no-ui",
+            "ui_alive": self.ui_alive,
+            "degraded": self.degraded,
+            "task_count": len(self.active_tasks),
+            "tasks": sorted(self.active_tasks),
+            "intervention_policy": self.intervention,
+            "pending_approvals": pending,
+            "emergency_stop_path": "shared",
+            "owned": self.owned(),
+            "perf_ms": dict(self.perf),
+        }

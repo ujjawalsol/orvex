@@ -1,124 +1,64 @@
-"""System-wide ORVEX automation controller UI (companion process).
+"""System-wide ORVEX automation controller UI (singleton companion service).
 
-One topmost lightweight Tk window in the top-right work area, plus real Tk
-buttons so every control is reachable by keyboard, mouse and screen reader.
-No Explorer / taskbar / DWM / shell / registry modification. No browser DOM or
-webpage injection. The authoritative automation state is the engine-side
-AutomationController (controller.py), never this window and never the browser.
-
-Wire protocol: JSON lines on stdin (engine -> UI), JSON lines on stdout
-(UI -> engine). UI-owned responsibilities:
-  * render state, never compute it
-  * emit control intents (pause/resume/stop/take_control/approve/deny)
-  * heartbeat (`alive`) so the engine can fail-safe pause if the UI dies
-  * report physical user input while RUNNING (event only, never content)
-
-Threading: Tk is touched ONLY on the main thread. Worker threads hand work to
-the main loop through `queue.Queue` and a stdlib `threading.Event` for exit.
+Maintains a single, persistent, activity-aware control surface for the user's
+desktop session. Decoupled from individual MCP server lifetimes:
+  * Singleton enforcement via Windows Named Mutex (Local\\ORVEX_ControllerUI_Singleton_Mutex)
+  * Local IPC over Windows Named Pipe (\\\\.\\pipe\\orvex_controller_ipc) with secret auth key
+  * Activity-Aware Visibility: 100% hidden when idle; visible bottom-center when automating
+  * Zero Focus Stealing: WS_EX_NOACTIVATE ensures foreground window is never stolen
+  * Dynamic Contextual Controls:
+      - RUNNING: [ Take Control ]  [ Stop ]
+      - USER_CONTROL: [ Resume Automation ]  [ Stop ]
+      - WAITING_APPROVAL: [ Continue ]  [ Stop ]
+      - STOPPED / COMPLETED: Brief confirmation (1.5s), then auto-withdraw
 """
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 import json
+import os
 from pathlib import Path
 import queue
 import re
+import secrets
 import sys
 import threading
 import time
 import tkinter as tk
-from ctypes import wintypes
+from multiprocessing.connection import Listener
 
-STATE_IDLE = "IDLE"
+MUTEX_NAME = "Local\\ORVEX_ControllerUI_Singleton_Mutex"
+PIPE_NAME = r"\\.\pipe\orvex_controller_ipc"
 
-def _get_work_area() -> tuple[int, int, int, int]:
-    try:
-        from ctypes import wintypes
-        rc = wintypes.RECT()
-        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rc), 0):
-            return int(rc.left), int(rc.top), int(rc.right), int(rc.bottom)
-    except Exception:
-        pass
-    return 0, 0, 1920, 1080
+user32 = ctypes.windll.user32
+user32.SetWindowPos.argtypes = [
+    wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT
+]
+user32.SetWindowPos.restype = wintypes.BOOL
+HWND_TOPMOST = wintypes.HWND(-1)
 
+LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
+ORVEX_DIR = Path(LOCALAPPDATA) / "ORVEX" if LOCALAPPDATA else Path.home() / ".orvex"
+ORVEX_DIR.mkdir(parents=True, exist_ok=True)
+KEY_FILE = ORVEX_DIR / ".controller_ipc_key"
+STATE_FILE = ORVEX_DIR / ".controller_state.json"
 
-def _toplevel_hwnd(root: tk.Tk) -> int:
-    try:
-        f = root.wm_frame()
-        if f:
-            return int(f, 16)
-    except Exception:
-        pass
-    try:
-        p = ctypes.windll.user32.GetParent(root.winfo_id())
-        if p:
-            return int(p)
-    except Exception:
-        pass
-    return int(root.winfo_id())
+CARD_WIDTH = 380
+CARD_HEIGHT_ACTIVE = 115
+CARD_HEIGHT_COMPACT = 54
 
-# State -> (accent_color, default_title_text, force_expand)
-COLORS: dict[str, tuple[str, str, bool]] = {
-    "IDLE":             ("#6e6e6e", "ORVEX Idle",               False),
-    "RUNNING":          ("#00e676", "ORVEX Automation Active",  True),
-    "PAUSED":           ("#ff9100", "ORVEX Manual Control",     True),
-    "USER_CONTROL":     ("#ff9100", "ORVEX Manual Control",     True),
-    "WAITING_APPROVAL": ("#ff1744", "Approval Required",        True),
-    "STOPPING":         ("#ff9100", "Stopping",                 True),
-    "STOPPED":          ("#6e6e6e", "ORVEX Idle",               False),
-    "FAILED":           ("#ff1744", "Automation Failed",        True),
-    "BLOCKED":          ("#ff1744", "Automation Blocked",       True),
-}
-
-# button label -> wire event. Single mapping, single authority (engine).
-BUTTON_EVENTS = {
-    "Take Control": "take_control",
-    "Pause":        "pause",
-    "Resume":       "resume",
-    "Stop":         "stop",
-    "Approve":      "approve",
-    "Deny":         "deny",
-}
-
-# keyboard accelerators: Alt+<key>. Safety controls never need the mouse.
-ACCEL = {
-    "Take Control": "t",
-    "Pause":        "p",
-    "Resume":       "r",
-    "Stop":         "s",
-    "Approve":      "a",
-    "Deny":         "d",
-}
-
-BUTTONS_BY_STATE: dict[str, tuple[str, ...]] = {
-    "IDLE":             (),
-    "RUNNING":          ("Take Control", "Stop"),
-    "PAUSED":           ("Resume", "Stop"),
-    "USER_CONTROL":     ("Resume", "Stop"),
-    "WAITING_APPROVAL": ("Approve", "Deny", "Stop"),
-    "BLOCKED":          ("Stop",),
-    "FAILED":           ("Stop",),
-    "STOPPING":         ("Stop",),
-    "STOPPED":          (),
-}
-
-COMPACT_W, COMPACT_H = 340, 48
-EXPANDED_W, EXPANDED_H = 340, 135
-
-# Never surface internal handles, pointers, selectors or page content.
+# Safe redaction regexes
 _KEYWORDS = (r"(?i)\b(hwnd|pid|cdp|ws|com|dag|cookie|credential|selector|token|"
              r"secret|password|pwd|raw_input|session_id)\b")
-_RE_KV  = re.compile(_KEYWORDS + r"\s*[:=]\s*\S+")
-_RE_KW  = re.compile(_KEYWORDS)
+_RE_KV = re.compile(_KEYWORDS + r"\s*[:=]\s*\S+")
+_RE_KW = re.compile(_KEYWORDS)
 _RE_HEX = re.compile(r"(?i)\b0x[0-9a-f]{4,}\b")
 _RE_NUM = re.compile(r"(?<![.\w])\d{4,}(?![\d.])")
 _RE_SEL = re.compile(r"(?<!\w)#{1,2}[\w-]+|(?<!\w)//[\w/\[\]=]+|(?<=\s)\.[\w-]+")
 
 
-def redact(text: str, limit: int = 300) -> str:
-    """Strip internal identifiers, long numbers and selector/credential values
-    from user-visible detail. Deliberately aggressive: this string is shown to
-    the user, so anything not clearly human-readable is removed."""
+def redact(text: str, limit: int = 140) -> str:
     if not text:
         return ""
     out = _RE_KV.sub("<redacted>", str(text))
@@ -126,416 +66,627 @@ def redact(text: str, limit: int = 300) -> str:
     out = _RE_HEX.sub("<hex>", out)
     out = _RE_NUM.sub("<n>", out)
     out = _RE_KW.sub(lambda m: m.group(1).upper(), out)
-    return out[:limit]
+    return out.strip().replace("\n", " ")[:limit]
 
 
-def send(msg: dict) -> None:
+def get_auth_key() -> bytes:
+    if not KEY_FILE.exists():
+        KEY_FILE.write_bytes(secrets.token_bytes(32))
     try:
-        sys.stdout.write(json.dumps(msg) + "\n")
-        sys.stdout.flush()
-    except Exception:  # noqa: BLE001
-        pass
-
-
-class Hooks:
-    """WH_KEYBOARD_LL + WH_MOUSE_LL: physical-input *events* only.
-
-    The engine opens a short input window around its own injections, so any
-    event outside those windows while RUNNING is reported as
-    `user_intervention`. This never reads or stores user content, and never
-    interprets it as automation input.
-    """
-
-    def __init__(self, on_user_input, is_running) -> None:
-        self._on_user   = on_user_input
-        self._is_running = is_running
-        self._windows: list[tuple[float, float]] = []
-        self._lock = threading.Lock()
-        self._ids: list[int] = []
-        self._last_report = 0.0
-        self._user32: ctypes.WinDLL | None = None  # type: ignore[attr-defined]
-        self._cb_refs: list = []
-
-    def input_window(self, ms: float) -> None:
-        now = time.time()
-        with self._lock:
-            self._windows.append((now, now + ms / 1000.0))
-            self._windows = [(a, b) for a, b in self._windows if b > now][-8:]
-
-    def _ours(self) -> bool:
-        now = time.time()
-        with self._lock:
-            return any(a - 0.05 <= now <= b for a, b in self._windows)
-
-    def _cb(self, n_code: int, w_param: int, l_param: int) -> int:
+        return KEY_FILE.read_bytes()
+    except Exception:
+        key = secrets.token_bytes(32)
         try:
-            if n_code >= 0 and self._is_running() and not self._ours():
-                now = time.time()
-                if now - self._last_report > 2.0:
-                    self._last_report = now
-                    self._on_user()
-        except Exception:  # noqa: BLE001
+            KEY_FILE.write_bytes(key)
+        except Exception:
             pass
-        u = self._user32
-        return int(u.CallNextHookEx(None, n_code, w_param, l_param)) if u else 0
-
-    def start(self) -> None:
-        self._user32 = ctypes.windll.user32
-        user32 = self._user32
-        WH_KEYBOARD_LL, WH_MOUSE_LL = 13, 14
-        CMPFUNC = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
-            ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
-        )
-        self._cb_refs = [CMPFUNC(self._cb), CMPFUNC(self._cb)]
-        hmod = ctypes.windll.kernel32.GetModuleHandleW(None)
-        kh = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._cb_refs[0], hmod, 0)
-        mh = user32.SetWindowsHookExW(WH_MOUSE_LL, self._cb_refs[1], hmod, 0)
-        self._ids = [h for h in (kh, mh) if h]
-        msg = wintypes.MSG()
-        while True:
-            r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-            if r in (0, -1):
-                break
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
-
-    def stop(self) -> None:
-        u = self._user32
-        for h in self._ids:
-            try:
-                if u is not None:
-                    u.UnhookWindowsHookEx(h)
-            except Exception:  # noqa: BLE001
-                pass
-        self._ids = []
+        return key
 
 
-class UI:
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+def get_work_area(target_hwnd: int = 0) -> tuple[int, int, int, int]:
+    user32 = ctypes.windll.user32
+    try:
+        target = target_hwnd or user32.GetForegroundWindow()
+        hmon = user32.MonitorFromWindow(target, 2)  # MONITOR_DEFAULTTONEAREST
+        if hmon:
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                return (int(mi.rcWork.left), int(mi.rcWork.top),
+                        int(mi.rcWork.right), int(mi.rcWork.bottom))
+    except Exception:
+        pass
+    rc = wintypes.RECT()
+    try:
+        if user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rc), 0):
+            return int(rc.left), int(rc.top), int(rc.right), int(rc.bottom)
+    except Exception:
+        pass
+    return 0, 0, 1920, 1040
+
+
+class ControllerUI:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("ORVEX")
-        # Topmost, small, non-destructive; user may drag it anywhere and the
-        # engine's later state updates must NOT snap it back.
         self.root.attributes("-topmost", True)
-        # Tool window: occupies no taskbar slot, so the taskbar is never
-        # reserved or reshaped. No DWM/shell/registry involvement.
         try:
             self.root.attributes("-toolwindow", True)
-        except Exception:  # noqa: BLE001
-            pass
-
-        wl, wt, wr, wb = _get_work_area()
-        self._x = max(wl + 10, wr - COMPACT_W - 20)
-        self._y = wt + 20
-        self.root.geometry(f"{COMPACT_W}x{COMPACT_H}+{self._x}+{self._y}")
-        self.root.resizable(False, False)
-        self.root.configure(bg="#18181b")
-
-        self.state = STATE_IDLE
-        self._expanded = False
-        self._forced = False
-        self._running = False
-        self._closed = False
-        self.token = ""
-        self._last_alive_sent = time.time()
-
-        # Window & header icon
-        self._icon_img = None
-        for icon_candidate in (
-            Path(__file__).resolve().parent / "icon_16.png",
-            Path(__file__).resolve().parent.parent / "icon.png",
-        ):
-            if icon_candidate.exists():
-                try:
-                    self._icon_img = tk.PhotoImage(file=str(icon_candidate))
-                    self.root.iconphoto(False, self._icon_img)
-                    break
-                except Exception:
-                    pass
-
-        ico_path = Path(__file__).resolve().parent.parent / "icon.ico"
-        if ico_path.exists():
-            try:
-                self.root.iconbitmap(str(ico_path))
-            except Exception:
-                pass
-
-        # User reposition tracking
-        def _on_configure(ev):
-            if ev.widget == self.root:
-                wx = self.root.winfo_x()
-                wy = self.root.winfo_y()
-                if wx > 0 or wy > 0:
-                    self._x = wx
-                    self._y = wy
-        self.root.bind("<Configure>", _on_configure)
-
-        # Header row: icon + dot + product name + status label
-        self.head = tk.Frame(self.root, bg="#18181b")
-        self.head.pack(fill="x", padx=10, pady=(6, 2))
-
-        if self._icon_img is not None:
-            self.icon_lbl = tk.Label(self.head, image=self._icon_img, bg="#18181b")
-            self.icon_lbl.pack(side="left", padx=(0, 4))
-
-        self.dot = tk.Label(
-            self.head, text="●", fg="#6e6e6e", bg="#18181b",
-            font=("Segoe UI", 12))
-        self.dot.pack(side="left", padx=(0, 4))
-
-        _brand = tk.Label(
-            self.head, text="ORVEX", fg="#38bdf8", bg="#18181b",
-            font=("Segoe UI", 9, "bold"))
-        _brand.pack(side="left", padx=(0, 8))
-
-        self.title_lbl = tk.Label(
-            self.head, text="Ready",
-            fg="#e4e4e7", bg="#18181b",
-            anchor="w", font=("Segoe UI", 9, "bold"))
-        self.title_lbl.pack(side="left", fill="x", expand=True)
-
-        # Expanded body: detail text + buttons
-        self.body = tk.Frame(self.root, bg="#18181b")
-        self.detail = tk.Label(
-            self.body, text="", wraplength=COMPACT_W - 24,
-            justify="left", fg="#a1a1aa", bg="#18181b",
-            font=("Segoe UI", 9))
-        self.detail.pack(padx=10, pady=(2, 4), anchor="w", fill="x")
-
-        self.bar = tk.Frame(self.body, bg="#18181b")
-        self.bar.pack(padx=8, pady=(2, 6), fill="x")
-        self.buttons: dict[str, tk.Button] = {}
-        for name in BUTTON_EVENTS:
-            bg_col = "#27272a"
-            fg_col = "#f4f4f5"
-            active_bg = "#3f3f46"
-            font_spec = ("Segoe UI", 8)
-            if name == "Stop":
-                bg_col = "#b91c1c"
-                fg_col = "#ffffff"
-                active_bg = "#dc2626"
-                font_spec = ("Segoe UI", 8, "bold")
-            elif name in ("Resume", "Approve"):
-                bg_col = "#15803d"
-                fg_col = "#ffffff"
-                active_bg = "#16a34a"
-                font_spec = ("Segoe UI", 8, "bold")
-            elif name == "Take Control":
-                font_spec = ("Segoe UI", 8, "bold")
-
-            b = tk.Button(
-                self.bar,
-                text=name,
-                font=font_spec,
-                bg=bg_col, fg=fg_col,
-                activebackground=active_bg, activeforeground="#ffffff",
-                relief="flat", bd=1,
-                padx=8, pady=3,
-                command=lambda n=name: self._emit(n),
-                takefocus=False)
-            self.buttons[name] = b
-
-        self.q: queue.Queue = queue.Queue()
-        self._quit = threading.Event()
-        self._apply({"cmd": "state", "state": "IDLE", "text": "ORVEX Idle"})
-        self.root.protocol("WM_DELETE_WINDOW", self.request_close)
-        self.root.bind("<Alt-KeyPress>", self._accel)
-
-        # Emit initial alive with window handle
-        try:
-            self.root.update_idletasks()
-            send({"event": "alive", "hwnd": _toplevel_hwnd(self.root)})
         except Exception:
             pass
 
-        self.root.after(80, self._pump)
+        self.root.resizable(False, False)
+        self.root.configure(bg="#18181b")
 
-    # ------------------------------------------------------------- helpers
+        self.root.update_idletasks()
+        self._wid = int(self.root.winfo_id())
+        p = user32.GetParent(self._wid)
+        self._hwnd = int(p) if (p and user32.IsWindow(p)) else self._wid
+        try:
+            user32.SetWindowTextW(self._hwnd, "ORVEX")
+            user32.SetWindowTextW(self._wid, "ORVEX")
+        except Exception:
+            pass
+        self._setup_window_styles(self._hwnd)
 
-    def _emit(self, name: str) -> None:
-        msg = {"event": BUTTON_EVENTS[name]}
-        if name in ("Approve", "Deny") and self.token:
-            msg["token"] = self.token
-        send(msg)
+        # Initial state: completely hidden when idle
+        self.root.withdraw()
 
-    def _accel(self, ev) -> str:
-        ch = (ev.char or "").lower()
-        for name, key in ACCEL.items():
-            if ch == key and self.buttons[name].winfo_ismapped():
-                self._emit(name)
-                return "break"
-        return ""
+        self.state = "IDLE"
+        self.tasks: dict[str, dict] = {}
+        self.clients: dict[str, any] = {}
+        self.client_lock = threading.Lock()
+        self._auto_hide_id: str | None = None
+        self._user_x: int | None = None
+        self._user_y: int | None = None
 
-    def request_close(self) -> None:
-        """User closed the panel: behave like a lost indicator (fail-safe)."""
-        send({"event": "ui_closed_by_user"})
-        self._quit.set()
+        # Build Card Layout
+        self._build_widgets()
 
-    def _visible(self) -> tuple[str, ...]:
-        if self.state in ("IDLE", "STOPPED"):
-            return ()
-        return BUTTONS_BY_STATE.get(self.state, ("Stop",))
+        # Thread queue & event loop
+        self.msg_queue: queue.Queue = queue.Queue()
+        self._running = True
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Alt-KeyPress>", self._on_accel)
 
-    def _sync_geometry(self) -> None:
-        # Position is user-owned: only change size, clamp within visible screen
-        has_detail = bool(self.detail.cget("text").strip())
-        if self._expanded:
-            if self.state == "WAITING_APPROVAL":
-                h = 205
-            elif has_detail:
-                h = EXPANDED_H
-            else:
-                h = 84
-        else:
-            h = COMPACT_H
-        wl, wt, wr, wb = _get_work_area()
-        self._x = max(wl, min(self._x, wr - COMPACT_W - 5))
-        self._y = max(wt, min(self._y, wb - h - 5))
-        self.root.geometry(f"{COMPACT_W}x{h}+{self._x}+{self._y}")
+        # Write state file for HWND/PID discovery
+        self._write_state_file()
 
-    def _apply(self, msg: dict) -> None:
-        kind = msg.get("cmd", "")
-        if kind == "state":
-            self.state = msg.get("state", "IDLE")
-            self.token = msg.get("token", "") or ""
-            color, default_text, force = COLORS.get(self.state, ("#5a5a5a", "", False))
-            self._running = self.state == "RUNNING"
-            text = redact(msg.get("text") or default_text, 120)
-            n = msg.get("task_count") or 0
-            if n > 1:
-                text = f"{text} ({n} tasks)"
-            self.title_lbl.config(text=text, fg="#a1a1aa" if self.state == "IDLE" else "#ffffff")
-            self.dot.config(fg=color)
-            self.detail.config(text=redact(msg.get("detail", ""), EXPANDED_W - 20))
-            self._forced = bool(msg.get("expand", force))
-            self._expanded = self._forced or self._hovered
-            self._layout()
-            self._sync_geometry()
+        # Start periodic tick
+        self.root.after(50, self._pump)
 
-            # Ensure window is visible and topmost on state transitions
-            if self.state in ("RUNNING", "USER_CONTROL", "PAUSED", "WAITING_APPROVAL"):
+    def _setup_window_styles(self, target_hwnd: int | None = None) -> None:
+        target = target_hwnd or self._hwnd
+        try:
+            user32 = ctypes.windll.user32
+            # Add WS_EX_NOACTIVATE (0x08000000) so clicking never steals foreground
+            GWL_EXSTYLE = -20
+            WS_EX_TOOLWINDOW = 0x00000080
+            WS_EX_TOPMOST = 0x00000008
+            old = user32.GetWindowLongW(target, GWL_EXSTYLE)
+            user32.SetWindowLongW(target, GWL_EXSTYLE,
+                                  old | WS_EX_TOOLWINDOW | WS_EX_TOPMOST)
+
+            # Enable DWM Immersive Dark Mode for title/frame
+            dwmapi = ctypes.windll.dwmapi
+            val = ctypes.c_int(1)
+            dwmapi.DwmSetWindowAttribute(target, 20, ctypes.byref(val), ctypes.sizeof(val))
+        except Exception:
+            pass
+
+    def _write_state_file(self) -> None:
+        try:
+            btn_coords = {}
+            if self.state in ("RUNNING", "USER_CONTROL", "WAITING_APPROVAL"):
                 try:
-                    self.root.deiconify()
-                    self.root.lift()
-                    self.root.attributes("-topmost", True)
-                    ctypes.windll.user32.SetWindowPos(
-                        _toplevel_hwnd(self.root), -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 | 0x0040)
+                    w1 = self.btn_left.winfo_width()
+                    if w1 > 0:
+                        btn_coords["left"] = [
+                            self.btn_left.winfo_rootx() + w1 // 2,
+                            self.btn_left.winfo_rooty() + self.btn_left.winfo_height() // 2,
+                        ]
+                    else:
+                        rx = self.root.winfo_rootx()
+                        ry = self.root.winfo_rooty()
+                        btn_coords["left"] = [rx + 110, ry + 45]
                 except Exception:
                     pass
-        elif kind == "exit":
-            self._quit.set()
 
-    # ------------------------------------------------------------- layout
+                try:
+                    w2 = self.btn_right.winfo_width()
+                    if w2 > 0:
+                        btn_coords["right"] = [
+                            self.btn_right.winfo_rootx() + w2 // 2,
+                            self.btn_right.winfo_rooty() + self.btn_right.winfo_height() // 2,
+                        ]
+                    else:
+                        rx = self.root.winfo_rootx()
+                        ry = self.root.winfo_rooty()
+                        btn_coords["right"] = [rx + 290, ry + 45]
+                except Exception:
+                    pass
 
-    _hovered = False
+            data = {
+                "pid": os.getpid(),
+                "hwnd": self._hwnd,
+                "wid": self._wid,
+                "timestamp": time.time(),
+                "state": self.state,
+                "active_tasks": len(self.tasks),
+                "buttons": btn_coords,
+            }
+            STATE_FILE.write_text(json.dumps(data), encoding="utf-8")
+        except Exception:
+            pass
 
-    def _enter(self, _ev=None) -> None:
-        if self._hovered:
-            return
-        self._hovered = True
-        if not self._forced:
-            self._expanded = True
-            self._sync_geometry()
-        self._layout()
+    def _build_widgets(self) -> None:
+        # Header Row: Dot + Brand + Sep + Status Title
+        self.head = tk.Frame(self.root, bg="#18181b")
+        self.head.pack(fill="x", padx=14, pady=(6, 2))
 
-    def _leave(self, _ev=None) -> None:
-        if not self._hovered:
-            return
-        self._hovered = False
-        if not self._forced:
-            self._expanded = False
-            self._sync_geometry()
-        self._layout()
+        self.dot = tk.Label(self.head, text="●", fg="#10b981", bg="#18181b",
+                            font=("Segoe UI", 10))
+        self.dot.pack(side="left", padx=(0, 5))
 
-    def _layout(self) -> None:
-        if self._expanded:
-            if not self.body.winfo_ismapped():
-                self.body.pack(fill="x", padx=0, pady=0)
-        elif self.body.winfo_ismapped():
-            self.body.pack_forget()
-        for b in self.buttons.values():
-            b.pack_forget()
-        for n in self._visible():
-            self.buttons[n].pack(side="left", padx=4, pady=2, expand=True, fill="x")
-        self.root.update_idletasks()
+        self.brand = tk.Label(self.head, text="ORVEX", fg="#38bdf8", bg="#18181b",
+                              font=("Segoe UI", 9, "bold"))
+        self.brand.pack(side="left", padx=(0, 6))
 
-    def _pump(self) -> None:
-        if self._quit.is_set():
-            self._drain()
+        self.sep = tk.Label(self.head, text="·", fg="#71717a", bg="#18181b",
+                            font=("Segoe UI", 9))
+        self.sep.pack(side="left", padx=(0, 6))
+
+        self.title_lbl = tk.Label(self.head, text="Automating", fg="#f4f4f5", bg="#18181b",
+                                  font=("Segoe UI", 9, "bold"))
+        self.title_lbl.pack(side="left")
+
+        # Subtitle Row: App Context & Step
+        self.sub_lbl = tk.Label(self.root, text="Ready", fg="#a1a1aa", bg="#18181b",
+                                font=("Segoe UI", 8), anchor="w")
+        self.sub_lbl.pack(fill="x", padx=14, pady=(0, 6))
+
+        # Action Buttons Row
+        self.btn_bar = tk.Frame(self.root, bg="#18181b")
+        self.btn_bar.pack(fill="x", padx=14, pady=(0, 8))
+
+        self.btn_left = tk.Button(
+            self.btn_bar, text="Take Control", font=("Segoe UI", 8, "bold"),
+            bg="#27272a", fg="#f4f4f5", activebackground="#3f3f46", activeforeground="#ffffff",
+            relief="flat", bd=1, padx=12, pady=3, takefocus=False,
+            command=self._on_left_click)
+        self.btn_left.pack(side="left", expand=True, fill="x", padx=(0, 6))
+
+        self.btn_right = tk.Button(
+            self.btn_bar, text="Stop", font=("Segoe UI", 8, "bold"),
+            bg="#b91c1c", fg="#ffffff", activebackground="#dc2626", activeforeground="#ffffff",
+            relief="flat", bd=1, padx=12, pady=3, takefocus=False,
+            command=self._on_right_click)
+        self.btn_right.pack(side="left", expand=True, fill="x")
+
+        # Drag tracking
+        self._drag_data = {"x": 0, "y": 0}
+        for w in (self.root, self.head, self.brand, self.sep, self.title_lbl, self.sub_lbl):
+            w.bind("<ButtonPress-1>", self._start_drag)
+            w.bind("<B1-Motion>", self._do_drag)
+
+    def _start_drag(self, event) -> None:
+        self._drag_data["x"] = event.x_root - self.root.winfo_x()
+        self._drag_data["y"] = event.y_root - self.root.winfo_y()
+
+    def _do_drag(self, event) -> None:
+        x = event.x_root - self._drag_data["x"]
+        y = event.y_root - self._drag_data["y"]
+        self._user_x = x
+        self._user_y = y
+        self.root.geometry(f"+{x}+{y}")
+
+    def _on_accel(self, ev) -> str:
+        ch = (ev.char or "").lower()
+        if ch == "t" and self.btn_left.cget("text") == "Take Control":
+            self._on_left_click()
+            return "break"
+        if ch == "r" and self.btn_left.cget("text") == "Resume Automation":
+            self._on_left_click()
+            return "break"
+        if ch == "c" and self.btn_left.cget("text") in ("Continue", "Approve"):
+            self._on_left_click()
+            return "break"
+        if ch == "s":
+            self._on_right_click()
+            return "break"
+        return ""
+
+    def _on_left_click(self) -> None:
+        btn_text = self.btn_left.cget("text")
+        if btn_text == "Take Control":
+            self.state = "USER_CONTROL"
+            self._render_state()
+            self._broadcast({"event": "take_control"})
+        elif btn_text == "Resume Automation":
+            self.state = "RUNNING"
+            self._render_state()
+            self._broadcast({"event": "resume"})
+        elif btn_text in ("Continue", "Approve"):
+            self._broadcast({"event": "approve"})
+            self.state = "RUNNING"
+            self._render_state()
+
+    def _on_right_click(self) -> None:
+        self.state = "STOPPED"
+        self._render_state()
+        self._broadcast({"event": "stop"})
+        self.tasks.clear()
+        self._schedule_auto_hide(1500)
+
+    def _on_close(self) -> None:
+        self.state = "STOPPED"
+        self._broadcast({"event": "stop"})
+        self.root.withdraw()
+
+    def _broadcast(self, msg: dict) -> None:
+        with self.client_lock:
+            for cid, conn in list(self.clients.items()):
+                try:
+                    conn.send(msg)
+                except Exception:
+                    pass
+
+    def _position_bottom_center(self, height: int) -> None:
+        wl, wt, wr, wb = get_work_area()
+        frame_pad = 42
+        if self._user_x is not None and self._user_y is not None:
+            # Preserve user-customized location
+            x = max(wl, min(self._user_x, wr - CARD_WIDTH - 5))
+            y = max(wt, min(self._user_y, wb - height - frame_pad))
+        else:
+            x = wl + ((wr - wl) - CARD_WIDTH) // 2
+            y = max(wt, wb - height - frame_pad)
+        self.root.geometry(f"{CARD_WIDTH}x{height}+{x}+{y}")
+
+    def show_card(self) -> None:
+        if self._auto_hide_id is not None:
             try:
-                self.root.quit()
-            except Exception:  # noqa: BLE001
-                pass
-            return
-        self._drain()
-        now = time.time()
-        if now - self._last_alive_sent > 1.5:
-            self._last_alive_sent = now
-            try:
-                send({"event": "alive", "hwnd": _toplevel_hwnd(self.root)})
+                self.root.after_cancel(self._auto_hide_id)
             except Exception:
                 pass
-        self.root.after(80, self._pump)
+            self._auto_hide_id = None
 
-    def _drain(self) -> None:
+        has_buttons = self.state in ("RUNNING", "USER_CONTROL", "WAITING_APPROVAL")
+        h = CARD_HEIGHT_ACTIVE if has_buttons else CARD_HEIGHT_COMPACT
+
+        self.root.deiconify()
+        self.root.update_idletasks()
+        user32 = ctypes.windll.user32
+        p = user32.GetParent(self._wid)
+        self._hwnd = int(p) if (p and user32.IsWindow(p)) else self._wid
+        try:
+            user32.SetWindowTextW(self._hwnd, "ORVEX")
+            user32.SetWindowTextW(self._wid, "ORVEX")
+        except Exception:
+            pass
+        self._setup_window_styles(self._hwnd)
+        self._position_bottom_center(h)
+
+        try:
+            # SW_SHOWNOACTIVATE = 4, SWP_SHOWWINDOW = 0x0040, SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002
+            user32.ShowWindow(self._hwnd, 4)
+            user32.SetWindowPos(
+                self._hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                0x0001 | 0x0002 | 0x0040,
+            )
+        except Exception:
+            pass
+        try:
+            self.root.update()
+        except Exception:
+            pass
+        self._write_state_file()
+        self._broadcast({"event": "alive", "pid": os.getpid(), "hwnd": self._hwnd, "wid": self._wid})
+
+    def hide_card(self) -> None:
+        if self._auto_hide_id is not None:
+            try:
+                self.root.after_cancel(self._auto_hide_id)
+            except Exception:
+                pass
+            self._auto_hide_id = None
+        self.root.withdraw()
+        self.state = "IDLE"
+        self._write_state_file()
+
+    def _schedule_auto_hide(self, ms: int = 1500) -> None:
+        if self._auto_hide_id is not None:
+            try:
+                self.root.after_cancel(self._auto_hide_id)
+            except Exception:
+                pass
+        self._auto_hide_id = self.root.after(ms, self.hide_card)
+
+    def _render_state(self) -> None:
+        # Determine active task summary
+        n_tasks = len(self.tasks)
+        latest_task = next(reversed(self.tasks.values())) if self.tasks else {}
+        app_hint = latest_task.get("app_hint") or latest_task.get("goal") or "Automation active"
+        step_op = latest_task.get("op", "")
+        if step_op:
+            subtitle = f"{app_hint} · {step_op}"
+        else:
+            subtitle = app_hint
+
+        if n_tasks > 1:
+            subtitle = f"({n_tasks} tasks) {subtitle}"
+
+        if self.state == "RUNNING":
+            self.dot.config(fg="#10b981")
+            self.title_lbl.config(text="Automating", fg="#f4f4f5")
+            self.sub_lbl.config(text=redact(subtitle))
+            self.btn_left.config(
+                text="Take Control", bg="#27272a", fg="#f4f4f5",
+                activebackground="#3f3f46", activeforeground="#ffffff")
+            self.btn_right.config(
+                text="Stop", bg="#b91c1c", fg="#ffffff",
+                activebackground="#dc2626", activeforeground="#ffffff")
+            if not self.btn_bar.winfo_ismapped():
+                self.btn_bar.pack(fill="x", padx=14, pady=(0, 8))
+            self.show_card()
+
+        elif self.state == "USER_CONTROL":
+            self.dot.config(fg="#f59e0b")
+            self.title_lbl.config(text="Manual Control", fg="#f59e0b")
+            self.sub_lbl.config(text="Automation paused. You have control.")
+            self.btn_left.config(
+                text="Resume Automation", bg="#15803d", fg="#ffffff",
+                activebackground="#16a34a", activeforeground="#ffffff")
+            self.btn_right.config(
+                text="Stop", bg="#b91c1c", fg="#ffffff",
+                activebackground="#dc2626", activeforeground="#ffffff")
+            if not self.btn_bar.winfo_ismapped():
+                self.btn_bar.pack(fill="x", padx=14, pady=(0, 8))
+            self.show_card()
+
+        elif self.state == "WAITING_APPROVAL":
+            self.dot.config(fg="#ef4444")
+            self.title_lbl.config(text="Action Required", fg="#ef4444")
+            self.sub_lbl.config(text=redact(subtitle or "User confirmation required"))
+            self.btn_left.config(
+                text="Continue", bg="#15803d", fg="#ffffff",
+                activebackground="#16a34a", activeforeground="#ffffff")
+            self.btn_right.config(
+                text="Stop", bg="#b91c1c", fg="#ffffff",
+                activebackground="#dc2626", activeforeground="#ffffff")
+            if not self.btn_bar.winfo_ismapped():
+                self.btn_bar.pack(fill="x", padx=14, pady=(0, 8))
+            self.show_card()
+
+        elif self.state == "STOPPED":
+            self.dot.config(fg="#71717a")
+            self.title_lbl.config(text="Automation Stopped", fg="#e4e4e7")
+            self.sub_lbl.config(text="Cancelled by user")
+            self.btn_bar.pack_forget()
+            self.show_card()
+            self._schedule_auto_hide(1500)
+
+        elif self.state == "COMPLETED":
+            self.dot.config(fg="#10b981")
+            self.title_lbl.config(text="Completed", fg="#10b981")
+            self.sub_lbl.config(text="Task finished")
+            self.btn_bar.pack_forget()
+            self.show_card()
+            self._schedule_auto_hide(1500)
+
+        elif self.state == "IDLE":
+            self.hide_card()
+
+        self._write_state_file()
+
+    def apply_msg(self, msg: dict) -> None:
+        cmd = msg.get("cmd")
+        cid = msg.get("client_id", "")
+        tid = msg.get("task_id", "")
+
+        if cmd == "task_begin":
+            self.tasks[tid] = {
+                "client_id": cid,
+                "goal": msg.get("goal", ""),
+                "app_hint": msg.get("app_hint", ""),
+                "op": "",
+                "start": time.time(),
+            }
+            if self.state != "USER_CONTROL":
+                self.state = "RUNNING"
+            self._render_state()
+
+        elif cmd == "node_update":
+            if tid in self.tasks:
+                self.tasks[tid]["op"] = msg.get("op", "")
+                if msg.get("app_hint"):
+                    self.tasks[tid]["app_hint"] = msg.get("app_hint")
+            elif self.tasks:
+                # Update latest task
+                latest = next(reversed(self.tasks.values()))
+                latest["op"] = msg.get("op", "")
+                if msg.get("app_hint"):
+                    latest["app_hint"] = msg.get("app_hint")
+            self._render_state()
+
+        elif cmd == "task_end":
+            self.tasks.pop(tid, None)
+            status = msg.get("status", "success")
+            if not self.tasks:
+                if status == "success":
+                    self.state = "COMPLETED"
+                elif status in ("stopped", "cancelled"):
+                    self.state = "STOPPED"
+                else:
+                    self.state = "STOPPED"
+            self._render_state()
+
+        elif cmd == "set_state":
+            new_state = msg.get("state", "IDLE")
+            self.state = new_state
+            if new_state in ("RUNNING", "USER_CONTROL", "WAITING_APPROVAL"):
+                detail = msg.get("detail", "")
+                if detail:
+                    self.sub_lbl.config(text=redact(detail))
+            self._render_state()
+
+        elif cmd == "client_disconnected":
+            # Clean up tasks owned by this client
+            self.tasks = {k: v for k, v in self.tasks.items() if v.get("client_id") != cid}
+            if not self.tasks and self.state in ("RUNNING", "USER_CONTROL"):
+                self.state = "IDLE"
+            self._render_state()
+
+    def _pump(self) -> None:
         while True:
             try:
-                self._apply(self.q.get_nowait())
+                msg = self.msg_queue.get_nowait()
+                self.apply_msg(msg)
             except queue.Empty:
-                return
-            except Exception:  # noqa: BLE001
+                break
+            except Exception:
                 continue
+
+        # Periodically re-assert state file
+        self._write_state_file()
+        if self._running:
+            self.root.after(50, self._pump)
+
+
+# --- IPC Server Loop ---
+def run_ipc_server(ui: ControllerUI) -> None:
+    auth_key = get_auth_key()
+    try:
+        listener = Listener(PIPE_NAME, "AF_PIPE", authkey=auth_key)
+    except Exception as e:
+        # Another listener bound? Exit.
+        return
+
+    while ui._running:
+        try:
+            conn = listener.accept()
+            client_thread = threading.Thread(
+                target=handle_client_connection, args=(ui, conn), daemon=True)
+            client_thread.start()
+        except Exception:
+            if not ui._running:
+                break
+            time.sleep(0.05)
+            continue
+    try:
+        listener.close()
+    except Exception:
+        pass
+
+
+def handle_client_connection(ui: ControllerUI, conn: any) -> None:
+    client_id = f"client_{id(conn)}"
+    with ui.client_lock:
+        ui.clients[client_id] = conn
+
+    try:
+        # Handshake: send initial alive info with PID and HWND
+        conn.send({
+            "event": "alive",
+            "pid": os.getpid(),
+            "hwnd": ui._hwnd,
+            "state": ui.state,
+        })
+
+        while ui._running:
+            try:
+                msg = conn.recv()
+            except (EOFError, BrokenPipeError, ConnectionResetError):
+                break
+            except Exception:
+                break
+
+            cmd = msg.get("cmd")
+            if cmd == "register_client":
+                client_id = msg.get("client_id", client_id)
+                with ui.client_lock:
+                    ui.clients[client_id] = conn
+                conn.send({"event": "alive", "pid": os.getpid(), "hwnd": ui._hwnd})
+            elif cmd == "ping":
+                conn.send({"event": "alive", "pid": os.getpid(), "hwnd": ui._hwnd})
+            elif cmd == "disconnect":
+                break
+            else:
+                ui.msg_queue.put(msg)
+
+    finally:
+        with ui.client_lock:
+            ui.clients.pop(client_id, None)
+        ui.msg_queue.put({"cmd": "client_disconnected", "client_id": client_id})
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def attach_to_input_desktop() -> None:
+    try:
+        user32 = ctypes.windll.user32
+        hdesk = user32.OpenInputDesktop(0, False, 0x01FF)
+        if hdesk:
+            user32.SetThreadDesktop(hdesk)
+    except Exception:
+        pass
 
 
 def main() -> int:
-    ui = UI()
-    hooks = Hooks(on_user_input=lambda: send({"event": "user_intervention"}),
-                  is_running=lambda: ui._running)
+    # 0. Attach thread to active user input desktop before UI creation
+    attach_to_input_desktop()
 
-    for w in (ui.root, ui.head, ui.body):
-        w.bind("<Enter>", ui._enter, add="+")
-        w.bind("<Leave>", ui._leave, add="+")
+    # 1. Enforce strict Windows Session Singleton via Named Mutex
+    kernel32 = ctypes.windll.kernel32
+    h_mutex = kernel32.CreateMutexW(None, True, MUTEX_NAME)
+    if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        # Another controller UI process already created the mutex.
+        # Wait up to 2.5s for the primary instance's IPC pipe to become responsive.
+        auth_key = get_auth_key()
+        deadline = time.time() + 2.5
+        while time.time() < deadline:
+            try:
+                from multiprocessing.connection import Client
+                c = Client(PIPE_NAME, "AF_PIPE", authkey=auth_key)
+                c.send({"cmd": "ping"})
+                c.close()
+                if h_mutex:
+                    kernel32.CloseHandle(h_mutex)
+                return 0
+            except Exception:
+                time.sleep(0.08)
+        # If deadline elapsed without response, close handle and exit to prevent duplicate UI
+        if h_mutex:
+            kernel32.CloseHandle(h_mutex)
+        return 0
 
-    threading.Thread(target=hooks.start, daemon=True).start()
-
-    def reader() -> None:
-        try:
-            for line in sys.stdin:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    msg = json.loads(line)
-                except Exception:  # noqa: BLE001
-                    continue
-                if msg.get("cmd") == "input_window":
-                    hooks.input_window(float(msg.get("ms", 400)))
-                else:
-                    ui.q.put(msg)
-        except Exception:  # noqa: BLE001
-            pass
-        finally:
-            # Engine pipe broken -> exit 0. Engine watchdog safe-pauses.
-            ui.q.put({"cmd": "exit"})
-
-    threading.Thread(target=reader, daemon=True).start()
-
-    def heartbeat() -> None:
-        while not ui._quit.is_set():
-            send({"event": "alive"})
-            time.sleep(2.0)
-
-    threading.Thread(target=heartbeat, daemon=True).start()
+    # 2. Initialize UI & IPC
+    ui = ControllerUI()
+    ipc_thread = threading.Thread(target=run_ipc_server, args=(ui,), daemon=True)
+    ipc_thread.start()
 
     try:
         ui.root.mainloop()
     finally:
-        ui._quit.set()
-        hooks.stop()
+        ui._running = False
+        if h_mutex:
+            kernel32.CloseHandle(h_mutex)
         try:
-            ui.root.destroy()
-        except Exception:  # noqa: BLE001
+            STATE_FILE.unlink(missing_ok=True)
+        except Exception:
             pass
+
     return 0
 
 

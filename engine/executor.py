@@ -470,7 +470,7 @@ class Executor:
                     try:
                         win = self._wait_window_for_pid(launched_pid, expect, timeout_s=12)
                     except LookupError:
-                        if str(app).strip().lower() not in ("explorer", "file explorer", "chrome", "google chrome", "msedge", "edge"):
+                        if str(app).strip().lower() not in ("explorer", "file explorer", "chrome", "google chrome", "msedge", "edge", "notepad"):
                             raise
                         win = self._wait_new_hwnd(expect, before, timeout_s=12)
                     hwnd_found = self.uia.control_hwnd(win) or self._record_window(rec, win, expect)
