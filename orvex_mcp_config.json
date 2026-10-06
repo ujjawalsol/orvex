@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "orvex": {
+      "command": "python",
+      "args": [
+        "path/to/orvex/engine/server.py"
+      ]
+    }
+  }
+}

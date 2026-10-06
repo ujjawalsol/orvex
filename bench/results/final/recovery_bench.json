@@ -1,0 +1,36 @@
+{
+ "F-A": {
+  "fail_status": "needs_ai",
+  "failed_step": "s3",
+  "resume_handle": "RFA-1@v2",
+  "restart_ms": 713.6,
+  "restart_ok": "success",
+  "resume_ms": 82.6,
+  "resume_ok": "success",
+  "resume_result": {
+   "resumed": true,
+   "resumed_from": "FA-1",
+   "replayed": [
+    "s3"
+   ]
+  }
+ },
+ "F-B": {
+  "handle": "H1@v1",
+  "stale": "stale-detected:stale_handle H1@v1 epoch=1 current=3",
+  "reresolve_status": "success",
+  "ms": 13.8
+ },
+ "F-C": {
+  "fail_ms": 11395.5,
+  "resume_ms": 20.4,
+  "resume_ok": "success",
+  "resume_result": {
+   "resumed": true,
+   "resumed_from": "FC-1",
+   "replayed": [
+    "s3"
+   ]
+  }
+ }
+}

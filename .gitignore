@@ -1,0 +1,110 @@
+# ==============================================================================
+# ORVEX — .gitignore
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Python & Bytecode
+# ------------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ------------------------------------------------------------------------------
+# 2. Virtual Environments
+# ------------------------------------------------------------------------------
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# ------------------------------------------------------------------------------
+# 3. Packaging & Distribution Builds
+# ------------------------------------------------------------------------------
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ------------------------------------------------------------------------------
+# 4. Testing, Type Checking & Coverage
+# ------------------------------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+.cache
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+
+# ------------------------------------------------------------------------------
+# 5. IDEs & Editors
+# ------------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+.cursor/
+.antigravity/
+
+# ------------------------------------------------------------------------------
+# 6. Operating System Artifacts
+# ------------------------------------------------------------------------------
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+
+# ------------------------------------------------------------------------------
+# 7. ORVEX Runtime Logs, Diagnostic Traces & Ephemeral Sandboxes
+# ------------------------------------------------------------------------------
+# UI Automation library runtime log
+@AutomationLog.txt
+
+# Diagnostic logs and error traces
+*.log
+*.err
+*.tmp
+
+# Audit logs
+orvex_audit.jsonl
+*.jsonl
+!bench/results/final/**/*.jsonl
+
+# Ephemeral test directories
+scratch/
+orvex_sandbox/
+orvex_clean_test_*/
+orvex_zip_install_test_*/

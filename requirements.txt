@@ -1,0 +1,28 @@
+# ORVEX — Windows Automation MCP
+# Core runtime dependencies
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# Python 3.11+ required (3.12+ recommended)
+# Windows 10 21H2+ or Windows 11 required
+
+# MCP protocol
+mcp==2.3.0
+
+# Windows UI Automation (UIA) — required
+uiautomation>=2.0.18
+comtypes>=1.2.0
+
+# Browser CDP automation — required for browser tools
+websockets>=12.0
+
+# Process/system monitoring (optional but recommended)
+psutil>=5.9.0
+
+# Browser automation note:
+# ORVEX automates the user's existing Google Chrome or Microsoft Edge
+# via native CDP over websockets. No separate browser automation framework
+# (such as Playwright), browser binaries, or drivers are required or downloaded.
+#
+# NOTE: mss and pillow are NOT required by the engine (benchmarks only).

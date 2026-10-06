@@ -1,0 +1,136 @@
+{
+ "notepad_cold_warm": {
+  "launch": {
+   "n": 1,
+   "med": 5.4,
+   "max": 5.4
+  },
+  "wait_window": {
+   "n": 1,
+   "med": 136.1,
+   "max": 136.1
+  },
+  "verify_window": {
+   "n": 1,
+   "med": 79.6,
+   "max": 79.6
+  },
+  "find": {
+   "n": 2,
+   "med": 79.0,
+   "max": 79.0
+  }
+ },
+ "notepad_stale_reopen": {
+  "launch": {
+   "n": 2,
+   "med": 5.4,
+   "max": 5.4
+  },
+  "wait_window": {
+   "n": 2,
+   "med": 185.6,
+   "max": 185.6
+  },
+  "verify_window": {
+   "n": 2,
+   "med": 79.6,
+   "max": 79.6
+  },
+  "find": {
+   "n": 3,
+   "med": 69.3,
+   "max": 79.0
+  },
+  "close_window": {
+   "n": 1,
+   "med": 1007.6,
+   "max": 1007.6
+  }
+ },
+ "notepad_multi": {
+  "launch": {
+   "n": 3,
+   "med": 3.9,
+   "max": 5.4
+  },
+  "wait_window": {
+   "n": 3,
+   "med": 181.4,
+   "max": 185.6
+  },
+  "verify_window": {
+   "n": 3,
+   "med": 79.6,
+   "max": 84.6
+  },
+  "find": {
+   "n": 4,
+   "med": 79.0,
+   "max": 81.0
+  },
+  "close_window": {
+   "n": 1,
+   "med": 1007.6,
+   "max": 1007.6
+  }
+ },
+ "explorer_sandbox": {
+  "launch": {
+   "n": 4,
+   "med": 5.4,
+   "max": 11.6
+  },
+  "wait_window": {
+   "n": 4,
+   "med": 185.6,
+   "max": 1748.8
+  },
+  "verify_window": {
+   "n": 4,
+   "med": 79.6,
+   "max": 84.6
+  },
+  "find": {
+   "n": 5,
+   "med": 79.0,
+   "max": 244.9
+  },
+  "close_window": {
+   "n": 1,
+   "med": 1007.6,
+   "max": 1007.6
+  }
+ },
+ "settings_open": {
+  "launch": {
+   "n": 5,
+   "med": 5.4,
+   "max": 985.5
+  },
+  "wait_window": {
+   "n": 5,
+   "med": 181.4,
+   "max": 1748.8
+  },
+  "verify_window": {
+   "n": 5,
+   "med": 79.6,
+   "max": 200.7
+  },
+  "find": {
+   "n": 5,
+   "med": 79.0,
+   "max": 244.9
+  },
+  "close_window": {
+   "n": 1,
+   "med": 1007.6,
+   "max": 1007.6
+  }
+ },
+ "chrome_readonly": {
+  "find_ms": 147.7,
+  "title": "Automation MCP - Google Chrome"
+ }
+}

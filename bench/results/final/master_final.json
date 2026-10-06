@@ -1,0 +1,72 @@
+{
+ "WA": {
+  "baseline": {
+   "median_ms": 2966.8,
+   "p95_ms": 4344.1,
+   "calls": 21,
+   "arg_bytes": 3150,
+   "res_bytes": 20931,
+   "success": 3,
+   "T_first_med": 706.1
+  },
+  "engine": {
+   "median_ms": 3017.2,
+   "p95_ms": 3975.0,
+   "calls": 3,
+   "arg_bytes": 2661,
+   "res_bytes": 3038,
+   "success": 3,
+   "T_first_med": 3017.0
+  }
+ },
+ "WF": {
+  "baseline": {
+   "median_ms": 3048.3,
+   "p95_ms": 3485.9,
+   "calls": 21,
+   "arg_bytes": 3186,
+   "res_bytes": 20964,
+   "success": 3,
+   "T_first_med": 766.1
+  },
+  "engine": {
+   "median_ms": 3093.9,
+   "p95_ms": 4093.7,
+   "calls": 3,
+   "arg_bytes": 2697,
+   "res_bytes": 3049,
+   "success": 3,
+   "T_first_med": 3093.8
+  }
+ },
+ "WB": {
+  "baseline": {
+   "median_ms": 1469.5,
+   "p95_ms": 1481.2,
+   "calls": 15,
+   "arg_bytes": 1428,
+   "res_bytes": 14132,
+   "success": 3,
+   "T_first_med": 678.9
+  },
+  "engine": {
+   "median_ms": 1304.0,
+   "p95_ms": 1341.7,
+   "calls": 3,
+   "arg_bytes": 1050,
+   "res_bytes": 2842,
+   "success": 3,
+   "T_first_med": 1304.0
+  },
+  "reused": {
+   "median_ms": 471.0,
+   "p95_ms": 550.2,
+   "calls": 6,
+   "arg_bytes": 789,
+   "res_bytes": 5566,
+   "success": 3,
+   "T_first_med": 444.1,
+   "session": "BS_1@v1"
+  }
+ }
+}

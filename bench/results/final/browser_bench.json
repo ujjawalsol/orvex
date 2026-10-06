@@ -1,0 +1,124 @@
+{
+ "BT1_navigate_verify": {
+  "cdp": {
+   "median_ms": 1361.8,
+   "p95_ms": 1642.7,
+   "success": "5/5",
+   "sample_result": {
+    "backend": "cdp",
+    "url": "http://127.0.0.1:18923/simple.html",
+    "session": "BS_1@v1"
+   }
+  },
+  "playwright": {
+   "median_ms": 1547.6,
+   "p95_ms": 4797.5,
+   "success": "5/5",
+   "sample_result": {
+    "backend": "playwright",
+    "url": "http://127.0.0.1:18923/simple.html",
+    "session": "BS_1@v1"
+   }
+  }
+ },
+ "BT2_extract_text": {
+  "cdp": {
+   "median_ms": 1320.5,
+   "p95_ms": 1345.8,
+   "success": "5/5",
+   "sample_result": {
+    "backend": "cdp",
+    "text": "Probe Header",
+    "session": "BS_1@v1"
+   }
+  },
+  "playwright": {
+   "median_ms": 1657.4,
+   "p95_ms": 1735.2,
+   "success": "5/5",
+   "sample_result": {
+    "backend": "playwright",
+    "text": "Probe Header",
+    "session": "BS_1@v1"
+   }
+  }
+ },
+ "BT3_extract_table": {
+  "cdp": {
+   "median_ms": 1394.8,
+   "p95_ms": 1560.9,
+   "success": "5/5",
+   "sample_result": {
+    "backend": "cdp",
+    "rows": [
+     [
+      "Name",
+      "Age"
+     ],
+     [
+      "Ada",
+      "36"
+     ],
+     [
+      "Bob",
+      "41"
+     ],
+     [
+      "Cyd",
+      "29"
+     ]
+    ],
+    "session": "BS_1@v1"
+   }
+  },
+  "playwright": {
+   "median_ms": 1859.7,
+   "p95_ms": 1864.6,
+   "success": "5/5",
+   "sample_result": {
+    "backend": "playwright",
+    "rows": [
+     [
+      "Name",
+      "Age"
+     ],
+     [
+      "Ada",
+      "36"
+     ],
+     [
+      "Bob",
+      "41"
+     ],
+     [
+      "Cyd",
+      "29"
+     ]
+    ],
+    "session": "BS_1@v1"
+   }
+  }
+ },
+ "BT4_multi_dom": {
+  "cdp": {
+   "median_ms": 1372.2,
+   "p95_ms": 1600.8,
+   "success": "5/5",
+   "sample_result": {
+    "backend": "cdp",
+    "text": "price 42",
+    "session": "BS_1@v1"
+   }
+  },
+  "playwright": {
+   "median_ms": 1803.5,
+   "p95_ms": 1829.7,
+   "success": "5/5",
+   "sample_result": {
+    "backend": "playwright",
+    "text": "price 42",
+    "session": "BS_1@v1"
+   }
+  }
+ }
+}
