@@ -31,17 +31,43 @@ from ctypes import wintypes
 
 STATE_IDLE = "IDLE"
 
+def _get_work_area() -> tuple[int, int, int, int]:
+    try:
+        from ctypes import wintypes
+        rc = wintypes.RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rc), 0):
+            return int(rc.left), int(rc.top), int(rc.right), int(rc.bottom)
+    except Exception:
+        pass
+    return 0, 0, 1920, 1080
+
+
+def _toplevel_hwnd(root: tk.Tk) -> int:
+    try:
+        f = root.wm_frame()
+        if f:
+            return int(f, 16)
+    except Exception:
+        pass
+    try:
+        p = ctypes.windll.user32.GetParent(root.winfo_id())
+        if p:
+            return int(p)
+    except Exception:
+        pass
+    return int(root.winfo_id())
+
 # State -> (accent_color, default_title_text, force_expand)
 COLORS: dict[str, tuple[str, str, bool]] = {
-    "IDLE":             ("#5a5a5a", "Ready",                    False),
-    "RUNNING":          ("#0a7d32", "Automation Active",        False),
-    "PAUSED":           ("#c26400", "Automation Paused",        False),
-    "USER_CONTROL":     ("#c26400", "You have control",         False),
-    "WAITING_APPROVAL": ("#b00020", "Approval Required",        True),
-    "STOPPING":         ("#c26400", "Stopping",                 False),
-    "STOPPED":          ("#5a5a5a", "Automation Stopped",       False),
-    "FAILED":           ("#b00020", "Automation Failed",        True),
-    "BLOCKED":          ("#b00020", "Automation Blocked",       True),
+    "IDLE":             ("#6e6e6e", "ORVEX Idle",               False),
+    "RUNNING":          ("#00e676", "ORVEX Automation Active",  True),
+    "PAUSED":           ("#ff9100", "ORVEX Manual Control",     True),
+    "USER_CONTROL":     ("#ff9100", "ORVEX Manual Control",     True),
+    "WAITING_APPROVAL": ("#ff1744", "Approval Required",        True),
+    "STOPPING":         ("#ff9100", "Stopping",                 True),
+    "STOPPED":          ("#6e6e6e", "ORVEX Idle",               False),
+    "FAILED":           ("#ff1744", "Automation Failed",        True),
+    "BLOCKED":          ("#ff1744", "Automation Blocked",       True),
 }
 
 # button label -> wire event. Single mapping, single authority (engine).
@@ -65,17 +91,19 @@ ACCEL = {
 }
 
 BUTTONS_BY_STATE: dict[str, tuple[str, ...]] = {
-    "RUNNING":          ("Take Control", "Pause", "Stop"),
+    "IDLE":             (),
+    "RUNNING":          ("Take Control", "Stop"),
     "PAUSED":           ("Resume", "Stop"),
     "USER_CONTROL":     ("Resume", "Stop"),
     "WAITING_APPROVAL": ("Approve", "Deny", "Stop"),
     "BLOCKED":          ("Stop",),
     "FAILED":           ("Stop",),
     "STOPPING":         ("Stop",),
+    "STOPPED":          (),
 }
 
-COMPACT_W, COMPACT_H = 300, 58
-EXPANDED_W, EXPANDED_H = 340, 220
+COMPACT_W, COMPACT_H = 340, 48
+EXPANDED_W, EXPANDED_H = 340, 135
 
 # Never surface internal handles, pointers, selectors or page content.
 _KEYWORDS = (r"(?i)\b(hwnd|pid|cdp|ws|com|dag|cookie|credential|selector|token|"
@@ -195,12 +223,13 @@ class UI:
             self.root.attributes("-toolwindow", True)
         except Exception:  # noqa: BLE001
             pass
-        sw = self.root.winfo_screenwidth()
-        self._x = max(0, sw - COMPACT_W - 24)
-        self._y = 24
+
+        wl, wt, wr, wb = _get_work_area()
+        self._x = max(wl + 10, wr - COMPACT_W - 20)
+        self._y = wt + 20
         self.root.geometry(f"{COMPACT_W}x{COMPACT_H}+{self._x}+{self._y}")
         self.root.resizable(False, False)
-        self.root.configure(bg="#1e1e1e")
+        self.root.configure(bg="#18181b")
 
         self.state = STATE_IDLE
         self._expanded = False
@@ -208,6 +237,7 @@ class UI:
         self._running = False
         self._closed = False
         self.token = ""
+        self._last_alive_sent = time.time()
 
         # Window & header icon
         self._icon_img = None
@@ -230,59 +260,94 @@ class UI:
             except Exception:
                 pass
 
+        # User reposition tracking
+        def _on_configure(ev):
+            if ev.widget == self.root:
+                wx = self.root.winfo_x()
+                wy = self.root.winfo_y()
+                if wx > 0 or wy > 0:
+                    self._x = wx
+                    self._y = wy
+        self.root.bind("<Configure>", _on_configure)
+
         # Header row: icon + dot + product name + status label
-        self.head = tk.Frame(self.root, bg="#1e1e1e")
-        self.head.pack(fill="x", padx=0, pady=0)
+        self.head = tk.Frame(self.root, bg="#18181b")
+        self.head.pack(fill="x", padx=10, pady=(6, 2))
 
         if self._icon_img is not None:
-            self.icon_lbl = tk.Label(self.head, image=self._icon_img, bg="#1e1e1e")
-            self.icon_lbl.pack(side="left", padx=(8, 2))
+            self.icon_lbl = tk.Label(self.head, image=self._icon_img, bg="#18181b")
+            self.icon_lbl.pack(side="left", padx=(0, 4))
 
         self.dot = tk.Label(
-            self.head, text="●", fg="#5a5a5a", bg="#1e1e1e",
-            font=("Segoe UI", 13))
-        self.dot.pack(side="left", padx=(4, 2))
+            self.head, text="●", fg="#6e6e6e", bg="#18181b",
+            font=("Segoe UI", 12))
+        self.dot.pack(side="left", padx=(0, 4))
 
         _brand = tk.Label(
-            self.head, text="ORVEX", fg="#888888", bg="#1e1e1e",
-            font=("Segoe UI", 8, "bold"))
-        _brand.pack(side="left", padx=(0, 6))
+            self.head, text="ORVEX", fg="#38bdf8", bg="#18181b",
+            font=("Segoe UI", 9, "bold"))
+        _brand.pack(side="left", padx=(0, 8))
 
         self.title_lbl = tk.Label(
             self.head, text="Ready",
-            fg="#cccccc", bg="#1e1e1e",
+            fg="#e4e4e7", bg="#18181b",
             anchor="w", font=("Segoe UI", 9, "bold"))
         self.title_lbl.pack(side="left", fill="x", expand=True)
 
         # Expanded body: detail text + buttons
-        self.body = tk.Frame(self.root, bg="#1e1e1e")
+        self.body = tk.Frame(self.root, bg="#18181b")
         self.detail = tk.Label(
-            self.body, text="", wraplength=COMPACT_W - 20,
-            justify="left", fg="#aaaaaa", bg="#1e1e1e",
+            self.body, text="", wraplength=COMPACT_W - 24,
+            justify="left", fg="#a1a1aa", bg="#18181b",
             font=("Segoe UI", 9))
-        self.detail.pack(padx=10, pady=(4, 2), anchor="w")
+        self.detail.pack(padx=10, pady=(2, 4), anchor="w", fill="x")
 
-        self.bar = tk.Frame(self.body, bg="#1e1e1e")
-        self.bar.pack(padx=8, pady=6, fill="x")
+        self.bar = tk.Frame(self.body, bg="#18181b")
+        self.bar.pack(padx=8, pady=(2, 6), fill="x")
         self.buttons: dict[str, tk.Button] = {}
         for name in BUTTON_EVENTS:
+            bg_col = "#27272a"
+            fg_col = "#f4f4f5"
+            active_bg = "#3f3f46"
+            font_spec = ("Segoe UI", 8)
+            if name == "Stop":
+                bg_col = "#b91c1c"
+                fg_col = "#ffffff"
+                active_bg = "#dc2626"
+                font_spec = ("Segoe UI", 8, "bold")
+            elif name in ("Resume", "Approve"):
+                bg_col = "#15803d"
+                fg_col = "#ffffff"
+                active_bg = "#16a34a"
+                font_spec = ("Segoe UI", 8, "bold")
+            elif name == "Take Control":
+                font_spec = ("Segoe UI", 8, "bold")
+
             b = tk.Button(
                 self.bar,
-                text=f"{name}  (Alt+{ACCEL[name].upper()})",
-                width=14,
-                font=("Segoe UI", 9),
-                bg="#2d2d2d", fg="#cccccc",
-                activebackground="#3d3d3d", activeforeground="#ffffff",
+                text=name,
+                font=font_spec,
+                bg=bg_col, fg=fg_col,
+                activebackground=active_bg, activeforeground="#ffffff",
                 relief="flat", bd=1,
+                padx=8, pady=3,
                 command=lambda n=name: self._emit(n),
-                takefocus=True)
+                takefocus=False)
             self.buttons[name] = b
 
         self.q: queue.Queue = queue.Queue()
         self._quit = threading.Event()
-        self._apply({"cmd": "state", "state": "IDLE", "text": "Ready"})
+        self._apply({"cmd": "state", "state": "IDLE", "text": "ORVEX Idle"})
         self.root.protocol("WM_DELETE_WINDOW", self.request_close)
         self.root.bind("<Alt-KeyPress>", self._accel)
+
+        # Emit initial alive with window handle
+        try:
+            self.root.update_idletasks()
+            send({"event": "alive", "hwnd": _toplevel_hwnd(self.root)})
+        except Exception:
+            pass
+
         self.root.after(80, self._pump)
 
     # ------------------------------------------------------------- helpers
@@ -312,9 +377,21 @@ class UI:
         return BUTTONS_BY_STATE.get(self.state, ("Stop",))
 
     def _sync_geometry(self) -> None:
-        # Position is user-owned: only ever change size, never coordinates.
-        w, h = (EXPANDED_W, EXPANDED_H) if self._expanded else (COMPACT_W, COMPACT_H)
-        self.root.geometry(f"{w}x{h}")
+        # Position is user-owned: only change size, clamp within visible screen
+        has_detail = bool(self.detail.cget("text").strip())
+        if self._expanded:
+            if self.state == "WAITING_APPROVAL":
+                h = 205
+            elif has_detail:
+                h = EXPANDED_H
+            else:
+                h = 84
+        else:
+            h = COMPACT_H
+        wl, wt, wr, wb = _get_work_area()
+        self._x = max(wl, min(self._x, wr - COMPACT_W - 5))
+        self._y = max(wt, min(self._y, wb - h - 5))
+        self.root.geometry(f"{COMPACT_W}x{h}+{self._x}+{self._y}")
 
     def _apply(self, msg: dict) -> None:
         kind = msg.get("cmd", "")
@@ -327,13 +404,24 @@ class UI:
             n = msg.get("task_count") or 0
             if n > 1:
                 text = f"{text} ({n} tasks)"
-            self.title_lbl.config(text=text, fg="#cccccc" if self.state == "IDLE" else "#ffffff")
+            self.title_lbl.config(text=text, fg="#a1a1aa" if self.state == "IDLE" else "#ffffff")
             self.dot.config(fg=color)
             self.detail.config(text=redact(msg.get("detail", ""), EXPANDED_W - 20))
             self._forced = bool(msg.get("expand", force))
             self._expanded = self._forced or self._hovered
             self._layout()
             self._sync_geometry()
+
+            # Ensure window is visible and topmost on state transitions
+            if self.state in ("RUNNING", "USER_CONTROL", "PAUSED", "WAITING_APPROVAL"):
+                try:
+                    self.root.deiconify()
+                    self.root.lift()
+                    self.root.attributes("-topmost", True)
+                    ctypes.windll.user32.SetWindowPos(
+                        _toplevel_hwnd(self.root), -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 | 0x0040)
+                except Exception:
+                    pass
         elif kind == "exit":
             self._quit.set()
 
@@ -368,7 +456,7 @@ class UI:
         for b in self.buttons.values():
             b.pack_forget()
         for n in self._visible():
-            self.buttons[n].pack(side="left", padx=3, pady=2)
+            self.buttons[n].pack(side="left", padx=4, pady=2, expand=True, fill="x")
         self.root.update_idletasks()
 
     def _pump(self) -> None:
@@ -380,6 +468,13 @@ class UI:
                 pass
             return
         self._drain()
+        now = time.time()
+        if now - self._last_alive_sent > 1.5:
+            self._last_alive_sent = now
+            try:
+                send({"event": "alive", "hwnd": _toplevel_hwnd(self.root)})
+            except Exception:
+                pass
         self.root.after(80, self._pump)
 
     def _drain(self) -> None:

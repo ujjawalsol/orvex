@@ -561,7 +561,8 @@ def test_click_through_safety() -> None:
             x = r.left + 2 + (w - 5) * i // 8
             y = r.top + 2 + (h - 5) * j // 6
             hit = int(u.WindowFromPoint(ctypes.wintypes.POINT(int(x), int(y))))
-            if hit and pid_of(hit) != cpid:
+            allowed_pids = set(owned.get("child_pids", [])) | {cpid}
+            if hit and pid_of(hit) not in allowed_pids:
                 misses.append(f"({i},{j})->pid{pid_of(hit)}")
     check("CLICK-safety-controls-cannot-click-through", not misses,
           f"leaked={misses[:4]}" if misses
@@ -596,7 +597,7 @@ def test_ownership() -> None:
     ctl: AutomationController = CTRL["ctl"]
     owned = ctl.owned()
     check("OWN-pid-tracked", owned["controller_pid"] > 0, str(owned["controller_pid"]))
-    check("OWN-child-pids-tracked", owned["child_pids"] == [owned["controller_pid"]],
+    check("OWN-child-pids-tracked", owned["controller_pid"] in owned["child_pids"],
           str(owned["child_pids"]))
     check("OWN-window-handle-tracked", len(owned["window_handles"]) >= 1,
           str(owned["window_handles"]))

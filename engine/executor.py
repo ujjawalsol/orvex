@@ -364,8 +364,9 @@ class Executor:
                             lambda: self.stop.cancelled or rec.cancelled) == "stop":
                         return self._finish_cancelled(graph, done, retries, t0, rec)
                     app_hint = ((node.params or {}).get("app_hint")
-                                or (node.target.get("name") if isinstance(node.target, dict) else "")
-                                or ("Chrome" if "browser" in node.op else ""))
+                                or (node.target if isinstance(node.target, str) else (node.target.get("name") if isinstance(node.target, dict) else ""))
+                                or ("Chrome" if "browser" in node.op else "")
+                                or "Windows")
                     ctl.node_update(node.op, app_hint=str(app_hint))
                 except Exception:  # noqa: BLE001
                     pass
@@ -1581,7 +1582,7 @@ class Executor:
                     # Only go IDLE when ALL active tasks finish.
                     # Prevents IDLE<->RUNNING flicker in multi-call sessions.
                     if not ctl.active_tasks:
-                        ctl._set("IDLE", "No active automation")
+                        ctl._set("IDLE", "Ready", "Task completed")
                 elif status == "failed":
                     ctl.end_task(rec.task_id)
                     if not ctl.active_tasks:

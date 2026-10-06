@@ -92,6 +92,7 @@ class AutomationController:
         self._approval_validator: callable | None = None
         self._ulock = threading.Lock()
         self._pre_approval = "IDLE"
+        self._ui_hwnd = 0
 
     # ------------------------------------------------------------ lifecycle
 
@@ -109,8 +110,12 @@ class AutomationController:
             return True
         try:
             ui = str(Path(__file__).resolve().parent / "controller_ui.py")
+            python_bin = sys.executable
+            w_candidate = Path(sys.executable).with_name("pythonw.exe")
+            if w_candidate.exists():
+                python_bin = str(w_candidate)
             self.proc = subprocess.Popen(
-                [sys.executable, "-u", ui],
+                [python_bin, "-u", ui],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, bufsize=1,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -134,6 +139,12 @@ class AutomationController:
         pids: list[int] = []
         if self.proc is not None:
             pids.append(self.proc.pid)
+            try:
+                import psutil
+                for ch in psutil.Process(self.proc.pid).children(recursive=True):
+                    pids.append(ch.pid)
+            except Exception:  # noqa: BLE001
+                pass
         hwnds: list[int] = []
         if self.ui_alive:
             hwnds = self._ui_windows()
@@ -144,20 +155,41 @@ class AutomationController:
     def _ui_windows(self) -> list[int]:
         try:
             import ctypes
+            u = ctypes.windll.user32
+            if self._ui_hwnd and u.IsWindow(self._ui_hwnd) and u.IsWindowVisible(self._ui_hwnd):
+                return [self._ui_hwnd]
+        except Exception:
+            pass
+        try:
+            import ctypes
+            import psutil
 
             u = ctypes.windll.user32
             found: list[int] = []
-            pid = self.proc.pid if self.proc is not None else 0
+            target_pids: set[int] = set()
+            if self.proc is not None:
+                target_pids.add(self.proc.pid)
+                try:
+                    for ch in psutil.Process(self.proc.pid).children(recursive=True):
+                        target_pids.add(ch.pid)
+                except Exception:  # noqa: BLE001
+                    pass
 
-            @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)  # type: ignore[attr-defined]
+            if not target_pids:
+                return []
+
             def cb(hwnd, _l):
                 wpid = ctypes.c_ulong()
                 u.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
-                if wpid.value == pid and u.IsWindowVisible(hwnd):
-                    found.append(int(hwnd))
-                return True
+                if wpid.value in target_pids and u.IsWindowVisible(hwnd):
+                    text = ctypes.create_unicode_buffer(256)
+                    u.GetWindowTextW(hwnd, text, 256)
+                    if text.value == "ORVEX":
+                        found.append(int(hwnd))
+                return 1
 
-            u.EnumWindows(cb, 0)
+            CB = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_size_t, ctypes.c_size_t)
+            u.EnumWindows(CB(cb), 0)
             return found
         except Exception:  # noqa: BLE001
             return []
@@ -224,20 +256,28 @@ class AutomationController:
         self.paused.clear()
         self.user_control.clear()
         self._set("RUNNING", "Automation Active",
-                  f"AI is controlling this PC. Task: {goal}")
+                  f"AI is controlling this PC. Task: {goal}", expand=True)
 
-    def end_task(self, task_id: str = "") -> None:
+    def end_task(self, task_id: str = "", status: str = "success") -> None:
         if task_id:
             self.active_tasks.discard(task_id)
+        if not self.active_tasks and self.state == "RUNNING":
+            if status == "success":
+                self._set("IDLE", "Ready", "Task completed")
+            elif status in ("stopped", "cancelled"):
+                self._set("STOPPED", "Automation Stopped", "Cancelled by user")
+            elif status == "failed":
+                self._set("FAILED", "Automation Failed", "Task failed")
 
     def node_update(self, op: str, app_hint: str = "") -> None:
         if self.state != "RUNNING":
             return
         el = time.time() - self._t0
-        app_part = f"Controlling: {app_hint} | " if app_hint else ""
+        app_part = f"Controlling: {app_hint}\n" if app_hint else ""
         self._send({"cmd": "state", "state": "RUNNING",
                     "text": "Automation Active",
                     "detail": f"{app_part}Step: {op} | Elapsed: {el:.1f} s",
+                    "expand": True,
                     "task_count": len(self.active_tasks)})
 
     def check_paused(self, is_cancelled) -> str:
@@ -260,16 +300,16 @@ class AutomationController:
     def pause(self, why: str = "user") -> None:
         t = time.perf_counter()
         self.paused.set()
-        self._set("PAUSED", "Automation Paused", f"{why}. State preserved.")
+        self._set("PAUSED", "Automation Paused", f"{why}. State preserved.", expand=True)
         self.perf["pause_ms"] = (time.perf_counter() - t) * 1000.0
 
     def take_control(self) -> None:
         t = time.perf_counter()
         self.paused.set()
         self.user_control.set()
-        self._set("USER_CONTROL", "You have control",
-                  "Automation paused. Your input is yours; nothing is recorded "
-                  "as automation input.")
+        self._set("USER_CONTROL", "Manual Control",
+                  "Automation paused. You have control.\nClick Resume to continue.",
+                  expand=True)
         self.perf["take_control_ms"] = (time.perf_counter() - t) * 1000.0
 
     def resume(self) -> bool:
@@ -279,7 +319,8 @@ class AutomationController:
         self.paused.clear()
         self.user_control.clear()
         self._set("RUNNING", "Automation Active",
-                  f"AI is controlling this PC. Task: {self.task_info.get('goal', '')}")
+                  f"AI is controlling this PC. Task: {self.task_info.get('goal', '')}",
+                  expand=True)
         self.perf["resume_ms"] = (time.perf_counter() - t) * 1000.0
         return True
 
@@ -429,13 +470,15 @@ class AutomationController:
                     msg = json.loads(line)
                 except Exception:  # noqa: BLE001
                     continue
-                self._on_ui_event(msg.get("event", ""), msg.get("token", ""))
+                self._on_ui_event(msg.get("event", ""), msg.get("token", ""), msg=msg)
         except Exception:  # noqa: BLE001
             pass
 
-    def _on_ui_event(self, ev: str, token: str = "") -> None:
+    def _on_ui_event(self, ev: str, token: str = "", msg: dict | None = None) -> None:
         if ev == "alive":
             self._last_alive = time.time()
+            if msg and "hwnd" in msg:
+                self._ui_hwnd = int(msg["hwnd"])
         elif ev == "pause":
             self.pause("controller button")
             self._fire_pause_cb("pause")

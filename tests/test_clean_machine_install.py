@@ -49,6 +49,15 @@ def main():
         print(f"    MCP Host test output: {res2.stdout.strip()}")
         assert res2.returncode == 0, f"MCP host test failed: {res2.stderr}"
 
+        print("[4b] Verifying client configuration manager in fresh environment...")
+        res_cfg = subprocess.run([
+            venv_py, os.path.join(temp_dir, "engine", "configure_clients.py"), "--status",
+            "--install-dir", temp_dir, "--python-exe", venv_py
+        ], cwd=temp_dir, capture_output=True, text=True)
+        assert res_cfg.returncode == 0, f"configure_clients status failed: {res_cfg.stderr}"
+        assert "AI CLIENTS" in res_cfg.stdout, f"Missing AI CLIENTS summary: {res_cfg.stdout}"
+        print("    Client configuration manager: OK")
+
         print("[5] Testing Notepad automation through fresh environment...")
         res3 = subprocess.run([
             venv_py, "-c",

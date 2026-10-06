@@ -53,40 +53,68 @@ ORVEX is a Windows automation MCP server designed to be significantly faster tha
 
 ---
 
-## Installation & Setup
+## Installation
 
-### Option 1: One-Click Windows Setup (Recommended)
+Install ORVEX once.
+
+ORVEX automatically detects supported AI clients and registers itself as an MCP server.
+
+No manual MCP configuration is normally required.
+
+### Supported Clients:
+- **OpenCode**
+- **Claude Code**
+- **VS Code / GitHub Copilot**
+- **Cursor**
+- **Windsurf**
+- **Antigravity**
+- **Claude Desktop**
+
+During installation, the installer reports client status:
+- `✓` **Automatically configured** (Connected)
+- `⚠` **Detected but manual setup required**
+- `—` **Not installed** (safely skipped)
+
+### One-Click Windows Setup (Recommended)
 Run the automated installer script:
 ```powershell
 .\install.bat
 ```
-*(Installation was measured at under 20 seconds on the certification machine. Automatically sets up `.venv`, installs the 5 direct packages, verifies the engine, and generates `orvex_mcp_config.json`).*
+*(Idempotent: safe to run repeatedly. Automatically sets up `.venv`, installs direct dependencies, verifies the engine, and registers ORVEX across all detected AI clients while preserving 100% of existing user MCP servers).*
 
-### Option 2: Manual Pip Installation
+### Clean Uninstallation
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
+.\uninstall.bat
 ```
+*(Unregisters ORVEX from all AI clients without touching other servers, removes `.venv`, and clears temporary test sandboxes).*
 
 ---
 
-## MCP Configuration
+## MCP Architecture & Universal Entry Point
 
-Add ORVEX to your MCP client configuration (e.g., Claude Desktop, Cursor, Goose, Zed). For **Claude Desktop**, edit `%APPDATA%\Claude\claude_desktop_config.json`:
+ORVEX provides a single canonical MCP server entry point across all AI clients:
 
-```json
-{
-  "mcpServers": {
-    "orvex": {
-      "command": "C:\\path\\to\\orvex\\.venv\\Scripts\\python.exe",
-      "args": ["C:\\path\\to\\orvex\\engine\\server.py"]
-    }
-  }
-}
+```text
+OpenCode ───────┐
+Claude Code ────┤
+VS Code ────────┤
+Cursor ─────────┤
+Windsurf ───────┤
+Antigravity ────┤
+Claude Desktop ─┤
+                 ↓
+             ORVEX MCP
+                 ↓
+        Windows Automation Engine
+                 ↓
+          Controller UI
 ```
 
-*Note: `install.bat` automatically outputs an `orvex_mcp_config.json` file in this directory with the exact absolute paths filled in for copy-pasting.*
+All clients launch the same tested server:
+```powershell
+python -m engine.server
+```
+with cwd set to the ORVEX installation directory. An updated reference file `orvex_mcp_config.json` is also maintained in the repository root for manual inspection or custom setups.
 
 ---
 
